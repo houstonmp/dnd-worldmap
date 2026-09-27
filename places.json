@@ -1,0 +1,33 @@
+{
+  "pins": [
+    {
+      "id": "7910dad2-8c17-4f25-b708-46dd1ed48f4d",
+      "name": "Continent of  Dolvad",
+      "x": 1866,
+      "y": 1184,
+      "note": ""
+    },
+    {
+      "id": "801cb370-b610-46e0-8dcb-1be818b1989c",
+      "name": "New Chicegas",
+      "x": 1927,
+      "y": 1208,
+      "note": ""
+    },
+    {
+      "id": "a3a0e414-e872-41d0-926c-1a0de4783a6e",
+      "name": "The Floating City of Rhuan",
+      "x": 1916,
+      "y": 1154,
+      "note": "This is a test"
+    }
+  ],
+  "islandLabels": [
+    {
+      "id": "540a793f-9487-4904-83b8-794f76507c01",
+      "name": "Hollomere",
+      "x": 1650,
+      "y": 859
+    }
+  ]
+}
