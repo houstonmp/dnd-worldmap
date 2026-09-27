@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drifting Isles</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --ink: #1a2229;
+    --sea: #1e3a4a;
+    --brass: #b8893a;
+    --fog: #e8ecef;
+    --kelp: #4f6b4a;
+    --font: 'IM Fell English', Georgia, 'Times New Roman', serif;
+  }
+  html, body { height: 100%; margin: 0; background: var(--ink); }
+  #map { height: 100%; background: var(--ink); font-family: var(--font); }
+
+  /* Scrolling layers: a clipped box holding a 200%-wide strip of two copies */
+  .scroll-layer { overflow: hidden; pointer-events: none; }
+  .scroll-strip { display: flex; width: 200%; height: 100%; will-change: transform; }
+  .scroll-strip img { display: block; width: 50%; height: 100%; max-width: none; user-select: none; }
+
+  /* Island names */
+  .island-label { background: none; border: none; }
+  .island-label span {
+    display: inline-block;
+    transform: translate(-50%, -50%);
+    white-space: nowrap;
+    font-family: var(--font);
+    font-style: italic;
+    font-size: 17px;
+    color: var(--ink);
+    text-shadow: 0 0 3px var(--fog), 0 0 6px var(--fog), 0 0 10px rgba(232, 236, 239, .8);
+  }
+
+  /* Control panel */
+  .drift-panel {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px 8px 8px;
+    background: rgba(26, 34, 41, .88);
+    color: var(--fog);
+    border: 1px solid var(--brass);
+    border-radius: 6px;
+    font-family: var(--font);
+    font-size: 15px;
+  }
+  .drift-panel button {
+    width: 34px; height: 34px;
+    display: grid; place-items: center;
+    background: none;
+    color: var(--brass);
+    border: 1px solid var(--brass);
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .drift-panel button:hover { background: rgba(184, 137, 58, .15); }
+  .drift-panel button:focus-visible,
+  .drift-panel input:focus-visible { outline: 2px solid var(--fog); outline-offset: 2px; }
+  .drift-panel label { display: flex; align-items: center; gap: 10px; }
+  .drift-panel input[type=range] { width: 130px; accent-color: var(--brass); }
+  .drift-panel output { min-width: 3.2em; font-variant-numeric: tabular-nums; }
+
+  .leaflet-control-layers {
+    font-family: var(--font);
+    font-size: 15px;
+    background: rgba(26, 34, 41, .88) !important;
+    color: var(--fog) !important;
+    border: 1px solid var(--brass) !important;
+  }
+  .leaflet-control-layers input { accent-color: var(--brass); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+/* ==========================================================================
+   CONFIG: everything you'd normally tweak lives here.
+   All images should share the same pixel size (width x height below).
+   Leave a src as null to use a generated placeholder.
+   ========================================================================== */
+const CONFIG = {
+  width: 2560,                 // px width of your images
+  height: 1440,                // px height of your images
+
+  baseMap: 'assets/World1-1.png',               // e.g. 'assets/map.png'
+
+  islands: {
+    src: 'assets/World1-sky-islands.png',                 // e.g. 'assets/islands.png' (transparent, tiles left-to-right)
+    loopSeconds: 180,          // seconds for one full crossing at 1x speed
+    direction: 1,              // 1 = enters from the right, -1 = enters from the left
+    opacity: 1,
+  },
+
+  clouds: {
+    src: null,                 // e.g. 'assets/clouds.png' (transparent, tiles left-to-right)
+    loopSeconds: 90,
+    direction: 1,
+    opacity: 0.55,
+  },
+
+  // Island names. x/y are pixel positions on the islands image, measured from its top-left.
+  labels: [
+    // { name: 'Veyra',            x: 420,  y: 480 },
+    // { name: 'The Cinder Keys',  x: 1150, y: 1080 },
+    // { name: 'Hollowmere',       x: 1780, y: 420 },
+    // { name: "Gull's Rest",      x: 2050, y: 1250 },
+  ],
+
+  startSpeed: 1,               // speed multiplier on load
+  maxSpeed: 3,                 // top of the speed slider
+  scrollWheelZoom: false,      // false plays nicer inside a Notion embed
+};
+
+/* ==========================================================================
+   Placeholder art (only used when a src above is null)
+   ========================================================================== */
+function seeded(seed) {
+  return () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+}
+
+function makeCanvas() {
+  const c = document.createElement('canvas');
+  c.width = CONFIG.width;
+  c.height = CONFIG.height;
+  return [c, c.getContext('2d')];
+}
+
+// Draws fn at x, x - width and x + width so shapes crossing an edge wrap seamlessly.
+function drawWrapped(fn) {
+  [-CONFIG.width, 0, CONFIG.width].forEach(fn);
+}
+
+function placeholderBase() {
+  const [c, g] = makeCanvas();
+  const grad = g.createRadialGradient(c.width / 2, c.height / 2, 100, c.width / 2, c.height / 2, c.width * 0.7);
+  grad.addColorStop(0, '#2a5063');
+  grad.addColorStop(1, '#16303d');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, c.width, c.height);
+  g.strokeStyle = 'rgba(232, 236, 239, .08)';
+  g.lineWidth = 2;
+  for (let x = 0; x <= c.width; x += 200) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, c.height); g.stroke(); }
+  for (let y = 0; y <= c.height; y += 200) { g.beginPath(); g.moveTo(0, y); g.lineTo(c.width, y); g.stroke(); }
+  return c.toDataURL();
+}
+
+function blobPath(g, cx, cy, radius, rand) {
+  const harmonics = [1, 2, 3, 5].map(n => ({ n, amp: rand() * 0.18, phase: rand() * Math.PI * 2 }));
+  g.beginPath();
+  for (let i = 0; i <= 72; i++) {
+    const a = (i / 72) * Math.PI * 2;
+    const r = radius * (1 + harmonics.reduce((s, h) => s + h.amp * Math.sin(h.n * a + h.phase), 0));
+    const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r * 0.75;
+    i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+  }
+  g.closePath();
+}
+
+function placeholderIslands() {
+  const [c, g] = makeCanvas();
+  const rand = seeded(7);
+  CONFIG.labels.forEach(({ x, y }) => {
+    const radius = 90 + rand() * 80;
+    const seed = Math.floor(rand() * 1e6) + 1;
+    drawWrapped(dx => {
+      const r = seeded(seed);
+      blobPath(g, x + dx, y, radius * 1.25, r);
+      g.fillStyle = 'rgba(120, 190, 200, .35)'; g.fill();            // shallows
+      blobPath(g, x + dx, y, radius, seeded(seed));
+      g.fillStyle = '#d9c9a3'; g.fill();                            // sand
+      blobPath(g, x + dx, y, radius * 0.8, seeded(seed));
+      g.fillStyle = '#4f6b4a'; g.fill();                            // land
+    });
+  });
+  return c.toDataURL();
+}
+
+function placeholderClouds() {
+  const [c, g] = makeCanvas();
+  const rand = seeded(42);
+  for (let i = 0; i < 14; i++) {
+    const cx = rand() * c.width, cy = rand() * c.height;
+    const puffs = Array.from({ length: 6 }, () => ({
+      ox: (rand() - 0.5) * 260, oy: (rand() - 0.5) * 70, r: 60 + rand() * 90,
+    }));
+    drawWrapped(dx => puffs.forEach(p => {
+      const grad = g.createRadialGradient(cx + dx + p.ox, cy + p.oy, 0, cx + dx + p.ox, cy + p.oy, p.r);
+      grad.addColorStop(0, 'rgba(255,255,255,.75)');
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      g.fillStyle = grad;
+      g.fillRect(cx + dx + p.ox - p.r, cy + p.oy - p.r, p.r * 2, p.r * 2);
+    }));
+  }
+  return c.toDataURL();
+}
+
+/* ==========================================================================
+   ScrollingLayer: an image overlay that scrolls its image in a seamless loop.
+   It's clipped to its bounds, so nothing spills past the edge of the map.
+   ========================================================================== */
+const ScrollingLayer = L.ImageOverlay.extend({
+  _initImage() {
+    const el = this._image = L.DomUtil.create('div', 'leaflet-image-layer scroll-layer');
+    if (this._zoomAnimated) L.DomUtil.addClass(el, 'leaflet-zoom-animated');
+    this._strip = L.DomUtil.create('div', 'scroll-strip', el);
+    for (let i = 0; i < 2; i++) {
+      const img = L.DomUtil.create('img', '', this._strip);
+      img.src = this._url;
+      img.alt = '';
+      img.draggable = false;
+    }
+    el.onselectstart = L.Util.falseFn;
+    el.onmousemove = L.Util.falseFn;
+  },
+  // progress: 0..1, how far through one full loop
+  setProgress(progress) {
+    if (this._strip) this._strip.style.transform = `translate3d(${-progress * 50}%, 0, 0)`;
+  },
+});
+
+/* ==========================================================================
+   Map setup
+   ========================================================================== */
+const W = CONFIG.width, H = CONFIG.height;
+const bounds = [[0, 0], [H, W]];
+
+const map = L.map('map', {
+  crs: L.CRS.Simple,
+  zoomSnap: 0.25,
+  scrollWheelZoom: CONFIG.scrollWheelZoom,
+  attributionControl: false,
+  maxBoundsViscosity: 0.8,
+});
+
+// Stack order: base map < islands < clouds < labels
+[['islands', 410], ['clouds', 420], ['labels', 450]].forEach(([name, z]) => {
+  map.createPane(name).style.zIndex = z;
+});
+map.getPane('labels').style.pointerEvents = 'none';
+
+L.imageOverlay(CONFIG.baseMap || placeholderBase(), bounds).addTo(map);
+
+const islands = new ScrollingLayer(CONFIG.islands.src || placeholderIslands(), bounds, {
+  pane: 'islands', opacity: CONFIG.islands.opacity,
+}).addTo(map);
+
+const clouds = new ScrollingLayer(CONFIG.clouds.src || placeholderClouds(), bounds, {
+  pane: 'clouds', opacity: CONFIG.clouds.opacity,
+}).addTo(map);
+
+const labelMarkers = CONFIG.labels.map(label => ({
+  ...label,
+  marker: L.marker([H - label.y, label.x], {
+    pane: 'labels',
+    interactive: false,
+    keyboard: false,
+    icon: L.divIcon({ className: 'island-label', html: `<span>${label.name}</span>`, iconSize: null }),
+  }),
+}));
+const labels = L.layerGroup(labelMarkers.map(l => l.marker)).addTo(map);
+
+map.fitBounds(bounds);
+map.setMinZoom(map.getZoom() - 0.5);
+map.setMaxBounds(L.latLngBounds(bounds).pad(0.15));
+
+L.control.layers(null, {
+  'Drifting isles': islands,
+  'Island names': labels,
+  'Clouds': clouds,
+}, { collapsed: true }).addTo(map);
+
+/* ==========================================================================
+   Speed + pause control
+   ========================================================================== */
+const state = {
+  speed: CONFIG.startSpeed,
+  paused: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+  islands: 0,   // loop progress 0..1
+  clouds: 0,
+};
+
+const DriftControl = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd() {
+    const panel = L.DomUtil.create('div', 'drift-panel');
+    panel.innerHTML = `
+      <button type="button" aria-label="Pause drift"></button>
+      <label>Drift speed
+        <input type="range" min="0" max="${CONFIG.maxSpeed}" step="0.05" value="${state.speed}">
+        <output></output>
+      </label>`;
+    L.DomEvent.disableClickPropagation(panel);
+    L.DomEvent.disableScrollPropagation(panel);
+
+    const button = panel.querySelector('button');
+    const slider = panel.querySelector('input');
+    const readout = panel.querySelector('output');
+
+    const render = () => {
+      button.textContent = state.paused ? '▶' : '❚❚';
+      button.setAttribute('aria-label', state.paused ? 'Resume drift' : 'Pause drift');
+      readout.textContent = `${state.speed.toFixed(2)}×`;
+    };
+    button.addEventListener('click', () => { state.paused = !state.paused; render(); });
+    slider.addEventListener('input', () => { state.speed = parseFloat(slider.value); render(); });
+    document.addEventListener('keydown', e => {
+      if (e.code === 'Space' && !['INPUT', 'BUTTON'].includes(document.activeElement.tagName)) {
+        e.preventDefault();
+        button.click();
+      }
+    });
+    render();
+    return panel;
+  },
+});
+new DriftControl().addTo(map);
+
+/* ==========================================================================
+   Animation loop (time-based, so speed is the same at any frame rate)
+   ========================================================================== */
+const wrap01 = v => ((v % 1) + 1) % 1;
+const EDGE_FADE = 0.03; // labels fade out within this fraction of the map edge
+
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now;
+
+  if (!state.paused && state.speed > 0) {
+    state.islands = wrap01(state.islands + CONFIG.islands.direction * state.speed * dt / CONFIG.islands.loopSeconds);
+    state.clouds  = wrap01(state.clouds  + CONFIG.clouds.direction  * state.speed * dt / CONFIG.clouds.loopSeconds);
+  }
+
+  islands.setProgress(state.islands);
+  clouds.setProgress(state.clouds);
+
+  labelMarkers.forEach(({ x, y, marker }) => {
+    const nx = wrap01(x / W - state.islands);           // label's current position, 0..1 across the map
+    marker.setLatLng([H - y, nx * W]);
+    marker.setOpacity(Math.min(1, Math.min(nx, 1 - nx) / EDGE_FADE));
+  });
+
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
