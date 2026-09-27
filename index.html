@@ -16,6 +16,7 @@
     --fog: #e8ecef;
     --kelp: #4f6b4a;
     --rust: #e08a7a;
+    --beacon: #e4572e;
     --font: 'IM Fell English', Georgia, 'Times New Roman', serif;
   }
   html, body { height: 100%; margin: 0; background: var(--ink); }
@@ -51,6 +52,40 @@
     transform: rotate(45deg);
   }
   .place-pin .name { position: absolute; top: 50%; transform: translateY(-50%); }
+
+  /* Private places (only ever shown in the editor) */
+  .place-pin.is-private .dot { opacity: .6; border-style: dashed; }
+  .place-pin.is-private .name, .island-label.is-private span { opacity: .7; }
+  .place-pin.is-private .name::after, .island-label.is-private span::after {
+    content: ' · private';
+    font-size: 11px;
+    font-style: normal;
+  }
+  .island-label.has-link span { cursor: pointer; }
+
+  /* Party marker: a simple "you are here" dot with a soft pulse */
+  .party-marker { background: none; border: none; }
+  .party-dot {
+    position: absolute; inset: 6px;
+    border-radius: 50%;
+    background: var(--beacon);
+    border: 2px solid var(--fog);
+    box-shadow: 0 1px 4px rgba(26, 34, 41, .6);
+  }
+  .party-pulse {
+    position: absolute; inset: 0;
+    border-radius: 50%;
+    background: rgba(228, 87, 46, .45);
+    animation: party-pulse 2.2s ease-out infinite;
+  }
+  @keyframes party-pulse {
+    from { transform: scale(.5); opacity: 1; }
+    to   { transform: scale(1.9); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .party-pulse { animation: none; transform: scale(1.2); opacity: .5; }
+  }
+  .editing:not(.fog-tool) .party-marker { cursor: move; }
 
   /* Edit mode affordances */
   .editing:not(.fog-tool) .island-label span { cursor: move; outline: 1px dashed rgba(184, 137, 58, .9); padding: 0 4px; }
@@ -142,13 +177,15 @@
   .popup-name { font-size: 18px; }
   .popup-kind { opacity: .75; font-style: italic; }
   .popup-note { margin: 6px 0 0; white-space: pre-wrap; }
+  .leaflet-container a.popup-link { display: inline-block; margin-top: 8px; color: var(--brass); }
+  .leaflet-container a.popup-link:hover { color: var(--fog); }
 
   .place-form { display: flex; flex-direction: column; gap: 8px; }
   .place-form h3 { margin: 0; font-size: 17px; font-weight: normal; color: var(--brass); }
   .place-form label { display: flex; flex-direction: column; gap: 3px; }
   .place-form fieldset { border: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
   .place-form fieldset label { flex-direction: row; align-items: center; gap: 6px; }
-  .place-form input[type=text], .place-form textarea, .place-form select {
+  .place-form input[type=text], .place-form input[type=url], .place-form textarea, .place-form select {
     box-sizing: border-box;
     width: 100%;
     padding: 4px 6px;

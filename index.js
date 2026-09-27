@@ -35,7 +35,11 @@ const CONFIG = {
     softness: 50,              // starting edge fade, in map pixels
   },
 
-  placesFile: 'places.json',   // pins, island names and fog; export a new one from edit mode
+  party: {
+    zoomIn: 1,                 // on load, zoom this far past the full-map view when centering on the party (0 = none)
+  },
+
+  placesFile: 'places.json',   // pins, island names, party and fog; export a new one from edit mode
 
   startSpeed: 1,               // speed multiplier on load
   maxSpeed: 3,                 // top of the speed slider
@@ -193,6 +197,18 @@ const newId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${
 const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const placeType = key => PLACE_TYPES[key] || PLACE_TYPES[DEFAULT_PLACE_TYPE] || Object.values(PLACE_TYPES)[0];
 const placeTypeKey = key => (PLACE_TYPES[key] ? key : DEFAULT_PLACE_TYPE);
+const isFogTool = tool => tool === 'reveal' || tool === 'hide';
+const isPrivate = place => place.visibility === 'private';
+
+// Only allow real web links (blocks things like javascript: URLs)
+function safeUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
 
 /* ==========================================================================
    Map setup
@@ -208,8 +224,8 @@ const map = L.map('map', {
 });
 const container = map.getContainer();
 
-// Stack order: base map < pins < islands < island names < fog < clouds
-[['pins', 405], ['islands', 410], ['labels', 415], ['fog', 430], ['clouds', 440]].forEach(([name, z]) => {
+// Stack order: base map < pins < islands < island names < fog < clouds < party marker
+[['pins', 405], ['islands', 410], ['labels', 415], ['fog', 430], ['clouds', 440], ['party', 450]].forEach(([name, z]) => {
   map.createPane(name).style.zIndex = z;
 });
 
@@ -225,8 +241,10 @@ const clouds = new ScrollingLayer(CONFIG.clouds.src || placeholderClouds(), boun
 
 const pinLayer = L.layerGroup().addTo(map);
 const islandLabelLayer = L.layerGroup().addTo(map);
+const partyLayer = L.layerGroup().addTo(map);   // always shown, so it's not in the layers menu
 
 map.fitBounds(bounds);
+const fitZoom = map.getZoom();
 map.setMinZoom(map.getZoom() - 0.5);
 map.setMaxBounds(L.latLngBounds(bounds).pad(0.15));
 
@@ -403,8 +421,9 @@ if (CONFIG.fog.enabled) {
    Coordinates are map pixels from the top-left.
    Island name x is measured on the islands image, so it stays with its island.
    ========================================================================== */
-const emptyData = () => ({ pins: [], islandLabels: [], fog: [] });
+const emptyData = () => ({ party: null, pins: [], islandLabels: [], fog: [] });
 const normalize = d => ({
+  party: Number.isFinite(d?.party?.x) && Number.isFinite(d?.party?.y) ? { x: d.party.x, y: d.party.y } : null,
   pins: Array.isArray(d?.pins) ? d.pins : [],
   islandLabels: Array.isArray(d?.islandLabels) ? d.islandLabels : [],
   fog: Array.isArray(d?.fog) ? d.fog : [],
@@ -478,6 +497,13 @@ async function loadData() {
     } catch { /* no draft available */ }
   }
   commit();
+  centerOnParty();
+}
+
+// Open the map on the party. Players can pan away freely afterwards.
+function centerOnParty() {
+  if (!data.party) return;
+  map.setView([H - data.party.y, data.party.x], fitZoom + CONFIG.party.zoomIn, { animate: false });
 }
 
 /* ==========================================================================
@@ -487,7 +513,7 @@ function pinIcon(pin) {
   const t = placeType(pin.type);
   const box = t.dotSize + 6;
   return L.divIcon({
-    className: 'place-pin',
+    className: `place-pin${isPrivate(pin) ? ' is-private' : ''}`,
     html: `<span class="dot" style="width:${t.dotSize}px;height:${t.dotSize}px;background:${t.color}"></span>` +
           `<span class="name" style="left:${box + 4}px;font-size:${t.fontSize}px">${escapeHtml(pin.name)}</span>`,
     iconSize: [box, box],
@@ -496,40 +522,81 @@ function pinIcon(pin) {
   });
 }
 
-const labelIcon = name => L.divIcon({
-  className: 'island-label',
-  html: `<span>${escapeHtml(name)}</span>`,
+const partyIcon = L.divIcon({
+  className: 'party-marker',
+  html: '<span class="party-pulse"></span><span class="party-dot"></span>',
+  iconSize: [24, 24],
+  iconAnchor: [12, 12],
+});
+
+function renderParty() {
+  partyLayer.clearLayers();
+  if (!data.party) return;
+  const movable = EDIT && (editor.tool === 'places' || editor.tool === 'party');
+  const marker = L.marker([H - data.party.y, data.party.x], {
+    pane: 'party',
+    icon: partyIcon,
+    title: 'The party is here',
+    alt: 'The party is here',
+    keyboard: false,
+    interactive: movable,
+    draggable: movable,
+  });
+  if (movable) {
+    marker.on('dragend', () => {
+      const ll = clampLatLng(marker.getLatLng());
+      change(() => { data.party = { x: Math.round(ll.lng), y: Math.round(H - ll.lat) }; }, { rebuildFog: false });
+    });
+  }
+  marker.addTo(partyLayer);
+}
+
+const labelIcon = label => L.divIcon({
+  className: `island-label${isPrivate(label) ? ' is-private' : ''}${!EDIT && safeUrl(label.link) ? ' has-link' : ''}`,
+  html: `<span>${escapeHtml(label.name)}</span>`,
   iconSize: null,
 });
 
-function viewPopup(pin) {
+// What players see when they click a place
+function viewPopup(place, kindLabel) {
   const el = document.createElement('div');
   const name = document.createElement('div');
   name.className = 'popup-name';
-  name.textContent = pin.name;
+  name.textContent = place.name;
   const kind = document.createElement('div');
   kind.className = 'popup-kind';
-  kind.textContent = placeType(pin.type).label;
+  kind.textContent = kindLabel;
   el.append(name, kind);
-  if (pin.note) {
+  if (place.note) {
     const note = document.createElement('p');
     note.className = 'popup-note';
-    note.textContent = pin.note;
+    note.textContent = place.note;
     el.append(note);
+  }
+  const href = safeUrl(place.link);
+  if (href) {
+    const link = document.createElement('a');
+    link.className = 'popup-link';
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = 'Open location page ↗';
+    el.append(link);
   }
   return el;
 }
 
 function renderPlaces() {
   map.closePopup();
+  renderParty();
   pinLayer.clearLayers();
   islandLabelLayer.clearLayers();
   islandLabelEntries = [];
   const editingPlaces = EDIT && editor.tool === 'places';
 
   data.pins.forEach(pin => {
-    // Players don't get pins that are still under the fog
-    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
+    // Players don't get private pins, or pins that are still under the fog
+    if (!EDIT && (isPrivate(pin) || (CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)))) return;
 
     const marker = L.marker([H - pin.y, pin.x], {
       pane: 'pins',
@@ -547,19 +614,29 @@ function renderPlaces() {
       });
       marker.on('click', () => openEditPopup(marker, pin, 'pins'));
     } else if (!EDIT) {
-      marker.bindPopup(() => viewPopup(pin));
+      marker.bindPopup(() => viewPopup(pin, placeType(pin.type).label));
     }
     marker.addTo(pinLayer);
   });
 
   data.islandLabels.forEach(label => {
+    if (!EDIT && isPrivate(label)) return;
+    const playerLink = !EDIT && safeUrl(label.link);
     const marker = L.marker([H - label.y, label.x], {
       pane: 'labels',
-      interactive: editingPlaces,
+      interactive: editingPlaces || !!playerLink,
       draggable: editingPlaces,
       keyboard: false,
-      icon: labelIcon(label.name),
+      icon: labelIcon(label),
     });
+    if (playerLink) {
+      // Island names drift, so check the fog where the name is right now
+      marker.on('click', () => {
+        const ll = marker.getLatLng();
+        if (CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) return;
+        L.popup().setLatLng(ll).setContent(viewPopup(label, 'Island')).openOn(map);
+      });
+    }
     const entry = { place: label, marker, dragging: false };
     if (editingPlaces) {
       marker.on('dragstart', () => { entry.dragging = true; });
@@ -622,7 +699,7 @@ new DriftControl().addTo(map);
    Edit mode (open the page with ?edit on the URL)
    ========================================================================== */
 const editor = {
-  tool: 'places',              // 'places' | 'reveal' | 'hide'
+  tool: 'places',              // 'places' | 'party' | 'reveal' | 'hide'
   shape: 'brush',              // 'brush' | 'rect' | 'ellipse' | 'lasso'
   size: CONFIG.fog.brushSize,
   feather: CONFIG.fog.softness,
@@ -631,6 +708,7 @@ const editor = {
 let editPanel = null;
 let lastType = 'pin';
 let lastKind = placeTypeKey(DEFAULT_PLACE_TYPE);
+let lastVisibility = 'public';
 
 function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
   const kindOptions = Object.entries(PLACE_TYPES)
@@ -648,6 +726,13 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
       </fieldset>` : ''}
     <label class="pin-only">Kind <select name="kind">${kindOptions}</select></label>
     <label class="pin-only">Note <textarea name="note" rows="3"></textarea></label>
+    <label>Link <input type="url" name="link" placeholder="https://…" autocomplete="off"></label>
+    <label>Visibility
+      <select name="visibility">
+        <option value="public">Public: players see it</option>
+        <option value="private">Private: editor only</option>
+      </select>
+    </label>
     <div class="row">
       <button type="submit" class="btn primary">Save</button>
       ${onDelete ? '<button type="button" class="btn danger" data-delete>Delete</button>' : ''}
@@ -657,6 +742,8 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
   form.elements.name.value = place.name || '';
   form.elements.note.value = place.note || '';
   form.elements.kind.value = place.type ? placeTypeKey(place.type) : lastKind;
+  form.elements.link.value = place.link || '';
+  form.elements.visibility.value = place.visibility || (place.id ? 'public' : lastVisibility);
 
   const currentType = () => (allowType ? form.elements.type.value : (isPin ? 'pin' : 'island'));
   const syncFields = () => form.querySelectorAll('.pin-only').forEach(el => { el.hidden = currentType() !== 'pin'; });
@@ -675,6 +762,8 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
       note: form.elements.note.value.trim(),
       kind: form.elements.kind.value,
       type: currentType(),
+      link: form.elements.link.value.trim(),
+      visibility: form.elements.visibility.value,
     });
   });
   form.querySelector('[data-delete]')?.addEventListener('click', onDelete);
@@ -696,14 +785,15 @@ function openAddPopup(latlng) {
     heading: 'New place',
     place: {},
     allowType: true,
-    onSave: ({ name, note, kind, type }) => {
+    onSave: ({ name, note, kind, type, link, visibility }) => {
       lastType = type;
+      lastVisibility = visibility;
       change(() => {
         if (type === 'island') {
-          data.islandLabels.push({ id: newId(), name, x: Math.round(islandX), y });
+          data.islandLabels.push({ id: newId(), name, x: Math.round(islandX), y, link, visibility });
         } else {
           lastKind = kind;
-          data.pins.push({ id: newId(), name, type: kind, x: Math.round(latlng.lng), y, note });
+          data.pins.push({ id: newId(), name, type: kind, x: Math.round(latlng.lng), y, note, link, visibility });
         }
       }, { rebuildFog: false });
     },
@@ -717,9 +807,11 @@ function openEditPopup(marker, place, listKey) {
     place,
     isPin,
     allowType: false,
-    onSave: ({ name, note, kind }) => {
+    onSave: ({ name, note, kind, link, visibility }) => {
       change(() => {
         place.name = name;
+        place.link = link;
+        place.visibility = visibility;
         if (isPin) {
           place.note = note;
           place.type = kind;
@@ -737,7 +829,7 @@ function openEditPopup(marker, place, listKey) {
 function setTool(tool) {
   editor.tool = tool;
   map.closePopup();
-  const fogTool = tool !== 'places';
+  const fogTool = isFogTool(tool);
   if (fogTool) { map.dragging.disable(); map.boxZoom.disable(); }
   else { map.dragging.enable(); map.boxZoom.enable(); }
   container.classList.toggle('fog-tool', fogTool);
@@ -753,7 +845,7 @@ let lastPointer = null;
 let drawing = null;   // { op, start } while a fog stroke or shape is in progress
 
 function updateBrushCursor(e = lastPointer) {
-  const show = EDIT && e && editor.tool !== 'places' && editor.shape === 'brush';
+  const show = EDIT && e && isFogTool(editor.tool) && editor.shape === 'brush';
   if (!show) { brushCursor.style.display = 'none'; return; }
   const rect = container.getBoundingClientRect();
   const d = editor.size * Math.pow(2, map.getZoom());   // map pixels -> screen pixels in CRS.Simple
@@ -774,7 +866,7 @@ function imagePoint(e) {
 const isOnUi = e => e.target.closest('.leaflet-control, .leaflet-popup');
 
 function startDrawing(e) {
-  if (editor.tool === 'places' || e.button !== 0 || isOnUi(e)) return;
+  if (!isFogTool(editor.tool) || e.button !== 0 || isOnUi(e)) return;
   e.preventDefault();
   e.stopPropagation();
   container.setPointerCapture(e.pointerId);
@@ -832,10 +924,14 @@ if (EDIT) {
   let lastPopupClose = 0;
   map.on('popupclose', () => { lastPopupClose = performance.now(); });
   map.on('click', e => {
-    if (editor.tool !== 'places' || performance.now() - lastPopupClose < 300) return;
+    if (isFogTool(editor.tool) || performance.now() - lastPopupClose < 300) return;
     const { lat, lng } = e.latlng;
     if (lat < 0 || lat > H || lng < 0 || lng > W) return;
-    openAddPopup(e.latlng);
+    if (editor.tool === 'party') {
+      change(() => { data.party = { x: Math.round(lng), y: Math.round(H - lat) }; }, { rebuildFog: false });
+    } else {
+      openAddPopup(e.latlng);
+    }
   });
 
   if (CONFIG.fog.enabled) {
@@ -858,6 +954,7 @@ if (EDIT) {
 
   const HELP = {
     places: 'Click the map to add a place. Drag one to move it, or click it to rename or delete.',
+    party: 'Click the map to put the party there, or drag the marker. The map opens centered on it.',
     reveal: 'Drag on the map to clear fog. Switch to Places to pan the map.',
     hide: 'Drag on the map to cover an area with fog again.',
   };
@@ -870,11 +967,15 @@ if (EDIT) {
         <h2>Editor</h2>
         <div class="seg" role="group" aria-label="Tool">
           <button type="button" class="btn" data-tool="places">Places</button>
+          <button type="button" class="btn" data-tool="party">Party</button>
           ${CONFIG.fog.enabled ? `
           <button type="button" class="btn" data-tool="reveal">Reveal</button>
           <button type="button" class="btn" data-tool="hide">Hide</button>` : ''}
         </div>
         <p class="muted" data-help></p>
+        <div class="row" data-party-options>
+          <button type="button" class="btn danger" data-party-clear>Remove party marker</button>
+        </div>
 
         <div data-fog-options>
           <div class="seg" role="group" aria-label="Shape" style="margin-bottom:9px">
@@ -925,6 +1026,9 @@ if (EDIT) {
       size.addEventListener('input', () => { editor.size = +size.value; this.update(); });
       feather.addEventListener('input', () => { editor.feather = +feather.value; this.update(); });
 
+      $('[data-party-clear]').addEventListener('click', () => {
+        change(() => { data.party = null; }, { rebuildFog: false });
+      });
       $('[data-undo]').addEventListener('click', undo);
       $('[data-redo]').addEventListener('click', redo);
       $('[data-fog-all]')?.addEventListener('click', () => {
@@ -965,7 +1069,9 @@ if (EDIT) {
         panel.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === editor.tool));
         panel.querySelectorAll('[data-shape]').forEach(b => b.setAttribute('aria-pressed', b.dataset.shape === editor.shape));
         $('[data-help]').textContent = HELP[editor.tool];
-        $('[data-fog-options]').hidden = editor.tool === 'places';
+        $('[data-fog-options]').hidden = !isFogTool(editor.tool);
+        $('[data-party-options]').hidden = editor.tool !== 'party';
+        $('[data-party-clear]').disabled = !data.party;
         $('[data-size-row]').hidden = editor.shape !== 'brush';
         $('[data-size-out]').textContent = editor.size;
         $('[data-feather-out]').textContent = editor.feather;
@@ -973,8 +1079,10 @@ if (EDIT) {
         $('[data-redo]').disabled = !undoStack.future.length;
 
         const p = data.pins.length, l = data.islandLabels.length, f = data.fog.length;
+        const priv = [...data.pins, ...data.islandLabels].filter(isPrivate).length;
         $('[data-count]').textContent =
           `${p} ${p === 1 ? 'pin' : 'pins'}, ${l} island ${l === 1 ? 'name' : 'names'}` +
+          (priv ? ` (${priv} private)` : '') +
           (CONFIG.fog.enabled ? `, ${f} fog ${f === 1 ? 'edit' : 'edits'}` : '');
 
         const isDraft = !same(data, deployed);
