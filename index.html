@@ -64,6 +64,65 @@
   }
   .island-label.has-link span { cursor: pointer; }
 
+  /* Map search (top center) and the go-to-party button */
+  .map-search {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1000;
+    width: min(380px, calc(100% - 150px));
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-family: var(--font);
+    font-size: 15px;
+    color: var(--fog);
+  }
+  .map-search .combo { position: relative; flex: 1; min-width: 0; }
+  .map-search .combo-input {
+    box-sizing: border-box;
+    width: 100%;
+    height: 36px;
+    padding: 0 10px;
+    background: rgba(26, 34, 41, .92);
+    color: var(--fog);
+    border: 1px solid var(--brass);
+    border-radius: 6px;
+    font: inherit;
+  }
+  .map-search .combo-input::placeholder { color: rgba(232, 236, 239, .55); }
+  .map-search .combo-list {
+    position: absolute;
+    top: 100%; left: 0; right: 0;
+    margin-top: 4px;
+    max-height: min(320px, 60vh);
+    border-color: var(--brass);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+  }
+  .party-btn {
+    flex: none;
+    width: 36px; height: 36px;
+    display: grid; place-items: center;
+    padding: 0;
+    background: rgba(26, 34, 41, .92);
+    color: var(--beacon);
+    border: 1px solid var(--brass);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .party-btn:hover { background: rgba(60, 50, 40, .95); }
+  .map-search input:focus-visible, .party-btn:focus-visible { outline: 2px solid var(--fog); outline-offset: 2px; }
+
+  /* Brief glow on whatever the search just jumped to */
+  .is-found { animation: found-glow .8s ease-in-out 3; }
+  @keyframes found-glow {
+    50% { filter: drop-shadow(0 0 6px var(--brass)) drop-shadow(0 0 14px var(--brass)); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .is-found { animation: none; filter: drop-shadow(0 0 6px var(--brass)); }
+  }
+
   /* Party marker: a simple "you are here" dot with a soft pulse */
   .party-marker { background: none; border: none; }
   .party-dot {
@@ -223,6 +282,8 @@
   .combo-option.is-active, .combo-option:hover { background: rgba(184, 137, 58, .2); }
   .combo-option[aria-selected=true] { color: var(--brass); }
   .combo-option.is-none { font-style: italic; opacity: .8; }
+  .combo-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .combo-detail { flex: none; font-size: 12px; opacity: .7; }
   .combo-note { padding: 4px 8px; font-size: 13px; opacity: .7; }
   .loc-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 20px; }
   .tag {

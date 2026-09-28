@@ -40,6 +40,10 @@ const CONFIG = {
     zoomIn: 1,                 // on load, zoom this far past the full-map view when centering on the party (0 = none)
   },
 
+  search: {
+    zoomIn: 1.5,               // when jumping to a place, zoom at least this far past the full-map view
+  },
+
   api: 'https://dnd-world-map-api.houston-mp.workers.dev',   // the map worker
   placesFile: 'places.json',   // only read once: imported the first time the editor finds the worker empty
 
@@ -447,6 +451,8 @@ let saved = emptyData();      // editor: the last version the worker confirmed
 let serverVersion = 0;        // editor: version of `saved` on the worker
 let locations = new Map();    // editor: notionId -> { id, name, url, public, pronunciation, aliases }
 let islandLabelEntries = [];
+let pinMarkers = new Map();   // pin id -> marker, so search can find it
+let partyMarker = null;
 let notionError = null;       // editor: last Notion sync problem reported by the worker
 
 const undoStack = { past: [], future: [] };
@@ -730,6 +736,8 @@ const partyIcon = L.divIcon({
 
 function renderParty() {
   partyLayer.clearLayers();
+  partyMarker = null;
+  updatePartyButton();
   if (!data.party) return;
   const movable = EDIT && (editor.tool === 'places' || editor.tool === 'party');
   const marker = L.marker([H - data.party.y, data.party.x], {
@@ -748,6 +756,7 @@ function renderParty() {
     });
   }
   marker.addTo(partyLayer);
+  partyMarker = marker;
 }
 
 // What players see when they click a place, e.g. "City・(New Shey-gaas)"
@@ -795,6 +804,7 @@ function renderPlaces() {
   pinLayer.clearLayers();
   islandLabelLayer.clearLayers();
   islandLabelEntries = [];
+  pinMarkers = new Map();
   const editingPlaces = EDIT && editor.tool === 'places';
 
   data.pins.forEach(pin => {
@@ -820,6 +830,7 @@ function renderPlaces() {
       marker.bindPopup(() => viewPopup(pin, placeType(pin.type).label));
     }
     marker.addTo(pinLayer);
+    pinMarkers.set(pin.id, marker);
   });
 
   data.islandLabels.forEach(label => {
@@ -911,15 +922,132 @@ let editPanel = null;
 let lastType = 'pin';
 let lastKind = placeTypeKey(DEFAULT_PLACE_TYPE);
 
+/* ---- Combobox ----
+   Shared by the Notion location picker and the map search: a text input that
+   filters a listbox. Arrows + Enter or the mouse pick an option; Escape closes.
+   getOptions(query) returns { options, notes }. Each option is
+   { label, detail?, detailTag?, className?, pinned?, selected?, ...anything }.
+   onChoose(option) runs before the list closes; onClose() runs whenever it closes. */
+let comboCount = 0;
+
+function createCombobox({ input, list, getOptions, onChoose, onClose = () => {} }) {
+  const uid = input.id || `combo-${++comboCount}`;
+  let query = '';
+  let shown = [];
+  let active = -1;
+
+  function setActive(i) {
+    active = shown.length ? clamp(i, 0, shown.length - 1) : -1;
+    list.querySelectorAll('.combo-option').forEach((li, n) => li.classList.toggle('is-active', n === active));
+    const li = active >= 0 ? list.querySelector(`#${CSS.escape(uid)}-opt-${active}`) : null;
+    if (li) {
+      input.setAttribute('aria-activedescendant', li.id);
+      li.scrollIntoView({ block: 'nearest' });
+    } else {
+      input.removeAttribute('aria-activedescendant');
+    }
+  }
+
+  function render() {
+    const { options, notes = [] } = getOptions(query);
+    shown = options;
+    list.replaceChildren();
+    options.forEach((opt, i) => {
+      const li = document.createElement('li');
+      li.id = `${uid}-opt-${i}`;
+      li.className = `combo-option${opt.className ? ` ${opt.className}` : ''}`;
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', String(!!opt.selected));
+      const label = document.createElement('span');
+      label.className = 'combo-label';
+      label.textContent = opt.label;
+      li.append(label);
+      if (opt.detail) {
+        const detail = document.createElement('span');
+        detail.className = opt.detailTag ? 'tag tag-muted' : 'combo-detail';
+        detail.textContent = opt.detail;
+        li.append(detail);
+      }
+      // pointerdown + preventDefault keeps focus in the input, so the list doesn't close first
+      li.addEventListener('pointerdown', e => { e.preventDefault(); choose(i); });
+      list.append(li);
+    });
+    notes.forEach(text => {
+      const li = document.createElement('li');
+      li.className = 'combo-note';
+      li.textContent = text;
+      list.append(li);
+    });
+    setActive(active);
+  }
+
+  function open() {
+    if (!list.hidden) return;
+    list.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    active = -1;
+    render();
+    setActive(Math.max(0, shown.findIndex(o => o.selected)));
+  }
+
+  function close() {
+    list.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+    query = '';
+    onClose();
+  }
+
+  function choose(i) {
+    const opt = shown[i];
+    if (!opt) return;
+    onChoose(opt);
+    close();
+  }
+
+  input.addEventListener('click', open);
+  input.addEventListener('blur', close);
+  input.addEventListener('input', () => {
+    query = input.value;
+    if (list.hidden) open();
+    render();
+    // While typing, jump to the first real match (skipping pinned rows like "Not linked yet")
+    const first = shown.findIndex(o => !o.pinned);
+    setActive(first >= 0 ? first : 0);
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (list.hidden) open();
+      else setActive(active + 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!list.hidden) setActive(active - 1);
+    } else if (e.key === 'Enter' && !list.hidden) {
+      e.preventDefault();   // pick instead of submitting a form
+      choose(active);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();  // close the list, not a popup around it
+      if (!list.hidden) close();
+      else input.blur();
+    }
+  });
+
+  return {
+    open,
+    close,
+    refresh() { if (!list.hidden) render(); },
+  };
+}
+
 /* ---- Notion location picker ----
-   A searchable dropdown (combobox). By default it lists only locations that
-   aren't on the map yet; a checkbox brings the linked ones back.
-   Type to filter by name or alias; arrows + Enter or the mouse to pick. */
-let pickerCount = 0;
+   By default it lists only locations that aren't on the map yet; a checkbox
+   brings the linked ones back. Type to filter by name or alias. */
 const PICKER_LIMIT = 50;   // rows rendered at once; typing narrows the rest
 
 function locationPicker(currentPlace, onChange) {
-  const uid = `loc-picker-${++pickerCount}`;
+  const uid = `loc-picker-${++comboCount}`;
   const root = document.createElement('div');
   root.className = 'loc-picker';
   root.innerHTML = `
@@ -939,85 +1067,10 @@ function locationPicker(currentPlace, onChange) {
   const tags = root.querySelector('[data-tags]');
 
   let selected = currentPlace?.notionId || null;
-  let query = '';
-  let shown = [];
-  let active = -1;
 
   const onMapElsewhere = id =>
     [...data.pins, ...data.islandLabels].some(p => p !== currentPlace && p.notionId === id);
   const labelFor = id => (id ? locations.get(id)?.name || 'Missing Notion page' : '');
-
-  function matches() {
-    const q = nameKey(query);
-    return [...locations.values()].filter(loc =>
-      (includeLinked.checked || loc.id === selected || !onMapElsewhere(loc.id)) &&
-      (!q || nameKey(loc.name).includes(q) || nameKey(loc.aliases).includes(q)));
-  }
-
-  function row(text, className) {
-    const li = document.createElement('li');
-    li.className = className;
-    li.textContent = text;
-    return li;
-  }
-
-  function render() {
-    const found = matches();
-    shown = [{ id: null, name: 'Not linked yet' }, ...found.slice(0, PICKER_LIMIT)];
-    list.replaceChildren();
-    shown.forEach((opt, i) => {
-      const li = row(opt.name, `combo-option${opt.id ? '' : ' is-none'}`);
-      li.id = `${uid}-opt-${i}`;
-      li.setAttribute('role', 'option');
-      li.setAttribute('aria-selected', String(opt.id === selected));
-      if (opt.id && onMapElsewhere(opt.id)) {
-        const tag = document.createElement('span');
-        tag.className = 'tag tag-muted';
-        tag.textContent = 'on map';
-        li.append(tag);
-      }
-      // pointerdown + preventDefault keeps focus in the input, so the list doesn't close first
-      li.addEventListener('pointerdown', e => { e.preventDefault(); choose(opt.id); });
-      list.append(li);
-    });
-    if (!found.length) list.append(row(query ? 'No matching locations' : 'Every location is already on the map', 'combo-note'));
-    if (found.length > PICKER_LIMIT) list.append(row(`${found.length - PICKER_LIMIT} more · keep typing to narrow it down`, 'combo-note'));
-    setActive(clamp(active, 0, shown.length - 1));
-  }
-
-  function setActive(i) {
-    active = i;
-    list.querySelectorAll('.combo-option').forEach((li, n) => li.classList.toggle('is-active', n === i));
-    const li = list.querySelector(`#${uid}-opt-${i}`);
-    if (li) {
-      input.setAttribute('aria-activedescendant', li.id);
-      li.scrollIntoView({ block: 'nearest' });
-    }
-  }
-
-  function open() {
-    if (!list.hidden) return;
-    list.hidden = false;
-    input.setAttribute('aria-expanded', 'true');
-    active = -1;
-    render();
-    setActive(Math.max(0, shown.findIndex(o => o.id === selected)));
-  }
-
-  function close() {
-    list.hidden = true;
-    input.setAttribute('aria-expanded', 'false');
-    input.removeAttribute('aria-activedescendant');
-    query = '';
-    input.value = labelFor(selected);
-  }
-
-  function choose(id) {
-    selected = id;
-    close();
-    renderTags();
-    onChange(id);
-  }
 
   function renderTags() {
     tags.replaceChildren();
@@ -1044,33 +1097,39 @@ function locationPicker(currentPlace, onChange) {
     }
   }
 
+  const combo = createCombobox({
+    input,
+    list,
+    getOptions(query) {
+      const q = nameKey(query);
+      const found = [...locations.values()].filter(loc =>
+        (includeLinked.checked || loc.id === selected || !onMapElsewhere(loc.id)) &&
+        (!q || nameKey(loc.name).includes(q) || nameKey(loc.aliases).includes(q)));
+      const options = [
+        { id: null, label: 'Not linked yet', className: 'is-none', pinned: true, selected: !selected },
+        ...found.slice(0, PICKER_LIMIT).map(loc => ({
+          id: loc.id,
+          label: loc.name,
+          selected: loc.id === selected,
+          detail: onMapElsewhere(loc.id) ? 'on map' : '',
+          detailTag: true,
+        })),
+      ];
+      const notes = [];
+      if (!found.length) notes.push(query ? 'No matching locations' : 'Every location is already on the map');
+      if (found.length > PICKER_LIMIT) notes.push(`${found.length - PICKER_LIMIT} more · keep typing to narrow it down`);
+      return { options, notes };
+    },
+    onChoose(opt) {
+      selected = opt.id;
+      renderTags();
+      onChange(selected);
+    },
+    onClose() { input.value = labelFor(selected); },
+  });
+
   input.addEventListener('focus', () => input.select());
-  input.addEventListener('click', open);
-  input.addEventListener('blur', close);
-  input.addEventListener('input', () => {
-    query = input.value;
-    if (list.hidden) open();
-    active = shown.length > 1 ? 1 : 0;   // jump to the first real match while typing
-    render();
-  });
-  input.addEventListener('keydown', e => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      if (list.hidden) open();
-      else setActive(Math.min(active + 1, shown.length - 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (!list.hidden) setActive(Math.max(active - 1, 0));
-    } else if (e.key === 'Enter' && !list.hidden) {
-      e.preventDefault();   // pick instead of submitting the form
-      choose(shown[active] ? shown[active].id : selected);
-    } else if (e.key === 'Escape' && !list.hidden) {
-      e.preventDefault();
-      e.stopPropagation();  // close the list, not the popup
-      close();
-    }
-  });
-  includeLinked.addEventListener('change', () => { input.focus(); open(); render(); });
+  includeLinked.addEventListener('change', () => { input.focus(); combo.open(); combo.refresh(); });
 
   input.value = labelFor(selected);
   renderTags();
@@ -1223,7 +1282,7 @@ function imagePoint(e) {
   return [Math.round(clamp(ll.lng, 0, W)), Math.round(clamp(H - ll.lat, 0, H))];
 }
 
-const isOnUi = e => e.target.closest('.leaflet-control, .leaflet-popup');
+const isOnUi = e => e.target.closest('.leaflet-control, .leaflet-popup, .map-search');
 
 function startDrawing(e) {
   if (!isFogTool(editor.tool) || e.button !== 0 || isOnUi(e)) return;
@@ -1313,7 +1372,7 @@ if (EDIT) {
 
   document.addEventListener('keydown', e => {
     const el = document.activeElement;
-    if ((el.tagName === 'INPUT' && el.type === 'text') || el.tagName === 'TEXTAREA') return;
+    if ((el.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'button'].includes(el.type)) || el.tagName === 'TEXTAREA') return;
     if (!(e.ctrlKey || e.metaKey)) return;
     const key = e.key.toLowerCase();
     if (key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
@@ -1476,6 +1535,133 @@ if (EDIT) {
   editPanel = new EditControl().addTo(map);
   editPanel.update();
 }
+
+/* ==========================================================================
+   Map search: find a place and fly to it, or jump to the party.
+   Players can only find places they could already see (public and out of the fog).
+   Press / to focus the search.
+   ========================================================================== */
+const SEARCH_LIMIT = 50;
+const prefersReducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function updatePartyButton() {
+  const button = document.querySelector('.party-btn');
+  if (button) button.hidden = !data.party;
+}
+
+function searchablePlaces() {
+  const found = [];
+  data.pins.forEach(pin => {
+    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
+    const info = placeInfo(pin);
+    found.push({ place: pin, kind: 'pin', info, kindLabel: placeType(pin.type).label });
+  });
+  islandLabelEntries.forEach(({ place, marker }) => {
+    const ll = marker.getLatLng();   // islands drift, so check where they are now
+    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) return;
+    found.push({ place, kind: 'island', info: placeInfo(place), kindLabel: 'Island' });
+  });
+  return found.sort((a, b) => a.info.name.localeCompare(b.info.name));
+}
+
+// Fly to a spot, then run `after` once the map settles
+function flyToSpot(latlng, after) {
+  const zoom = Math.max(map.getZoom(), fitZoom + CONFIG.search.zoomIn);
+  let done = false;
+  const finish = () => { if (!done) { done = true; after?.(); } };
+  map.once('moveend', finish);
+  setTimeout(finish, 1500);   // in case the view didn't need to move
+  if (prefersReducedMotion()) map.setView(latlng, zoom, { animate: false });
+  else map.flyTo(latlng, zoom, { duration: 0.8 });
+}
+
+function highlight(marker) {
+  const el = marker?.getElement();
+  if (!el) return;
+  el.classList.remove('is-found');
+  void el.offsetWidth;   // restart the animation
+  el.classList.add('is-found');
+  setTimeout(() => el.classList.remove('is-found'), 2400);
+}
+
+function goToPlace({ place, kind }) {
+  const marker = kind === 'pin'
+    ? pinMarkers.get(place.id)
+    : islandLabelEntries.find(e => e.place === place)?.marker;
+  if (!marker) return;
+  flyToSpot(marker.getLatLng(), () => {
+    highlight(marker);
+    if (EDIT) return;
+    if (kind === 'pin' && map.hasLayer(pinLayer)) {
+      marker.openPopup();
+    } else if (kind === 'island' && map.hasLayer(islandLabelLayer) && safeUrl(place.url)) {
+      L.popup().setLatLng(marker.getLatLng()).setContent(viewPopup(place, 'Island')).openOn(map);
+    }
+  });
+}
+
+function goToParty() {
+  if (!data.party) return;
+  flyToSpot(L.latLng(H - data.party.y, data.party.x), () => highlight(partyMarker));
+}
+
+(() => {
+  const bar = L.DomUtil.create('div', 'map-search', container);
+  bar.innerHTML = `
+    <div class="combo">
+      <input id="map-search-input" class="combo-input" type="search" role="combobox"
+        aria-label="Search places" aria-autocomplete="list" aria-expanded="false" aria-controls="map-search-list"
+        autocomplete="off" spellcheck="false" placeholder="Search places  ( / )">
+      <ul id="map-search-list" class="combo-list" role="listbox" hidden></ul>
+    </div>
+    <button type="button" class="party-btn" aria-label="Go to the party" title="Go to the party" hidden>
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <circle cx="12" cy="12" r="3.5" fill="currentColor"/>
+        <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M12 1v3.5M12 19.5V23M1 12h3.5M19.5 12H23" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>`;
+  L.DomEvent.disableClickPropagation(bar);
+  L.DomEvent.disableScrollPropagation(bar);
+  L.DomEvent.on(bar, 'pointerdown keydown', L.DomEvent.stopPropagation);
+
+  const input = bar.querySelector('.combo-input');
+  const list = bar.querySelector('.combo-list');
+
+  createCombobox({
+    input,
+    list,
+    getOptions(query) {
+      const q = nameKey(query);
+      const found = searchablePlaces().filter(({ info }) =>
+        !q || nameKey(info.name).includes(q) || nameKey(info.aliases).includes(q));
+      const options = found.slice(0, SEARCH_LIMIT).map(item => ({
+        ...item,
+        label: item.info.name,
+        detail: EDIT && item.info.status !== 'public' ? `${item.kindLabel} · ${item.info.status}` : item.kindLabel,
+      }));
+      const notes = [];
+      if (!found.length) notes.push(query ? 'No matching places' : 'No places on the map yet');
+      if (found.length > SEARCH_LIMIT) notes.push(`${found.length - SEARCH_LIMIT} more · keep typing to narrow it down`);
+      return { options, notes };
+    },
+    onChoose(item) {
+      input.value = '';
+      input.blur();
+      goToPlace(item);
+    },
+  });
+
+  bar.querySelector('.party-btn').addEventListener('click', goToParty);
+
+  // "/" focuses the search, like most sites
+  document.addEventListener('keydown', e => {
+    const el = document.activeElement;
+    if (e.key !== '/' || e.ctrlKey || e.metaKey || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return;
+    e.preventDefault();
+    input.focus();
+  });
+})();
 
 /* ==========================================================================
    Animation loop (time-based, so speed is the same at any frame rate)
