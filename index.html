@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>D&D - World Map</title>
+<title>D&amp;D - World Map</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&display=swap" rel="stylesheet">
@@ -19,6 +19,7 @@
     --beacon: #e4572e;
     --font: 'IM Fell English', Georgia, 'Times New Roman', serif;
   }
+  [hidden] { display: none !important; }
   html, body { height: 100%; margin: 0; background: var(--ink); }
   #map { height: 100%; background: var(--ink); font-family: var(--font); }
 
@@ -53,11 +54,11 @@
   }
   .place-pin .name { position: absolute; top: 50%; transform: translateY(-50%); }
 
-  /* Private places (only ever shown in the editor) */
-  .place-pin.is-private .dot { opacity: .6; border-style: dashed; }
-  .place-pin.is-private .name, .island-label.is-private span { opacity: .7; }
-  .place-pin.is-private .name::after, .island-label.is-private span::after {
-    content: ' · private';
+  /* Places that need attention in the editor (players never receive these) */
+  .place-pin.is-flagged .dot { opacity: .6; border-style: dashed; }
+  .place-pin.is-flagged .name, .island-label.is-flagged span { opacity: .7; }
+  .place-pin .name[data-tag]::after, .island-label span[data-tag]::after {
+    content: ' · ' attr(data-tag);
     font-size: 11px;
     font-style: normal;
   }
@@ -136,6 +137,7 @@
   .edit-panel h2 { margin: 0; font-size: 18px; font-weight: normal; color: var(--brass); }
   .edit-panel p { margin: 0; line-height: 1.35; }
   .edit-panel .muted { opacity: .75; font-size: 14px; }
+  .edit-panel .notion-error { color: var(--rust); font-size: 14px; overflow-wrap: anywhere; }
   .edit-panel hr { width: 100%; border: none; border-top: 1px solid rgba(184, 137, 58, .4); margin: 2px 0; }
   .edit-panel .slider { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center; }
   .edit-panel .slider input { grid-column: 1 / -1; accent-color: var(--brass); }
@@ -177,6 +179,7 @@
   .popup-name { font-size: 18px; }
   .popup-kind { opacity: .75; font-style: italic; }
   .popup-note { margin: 6px 0 0; white-space: pre-wrap; }
+  .popup-aliases { margin-top: 2px; opacity: .75; font-size: 14px; }
   .leaflet-container a.popup-link { display: inline-block; margin-top: 8px; color: var(--brass); }
   .leaflet-container a.popup-link:hover { color: var(--fog); }
 
@@ -197,6 +200,45 @@
   }
   .place-form select option { background: var(--ink); }
   .place-form input[type=radio] { accent-color: var(--brass); }
+  .place-form label.inline { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; }
+  .place-form input[type=checkbox] { accent-color: var(--brass); }
+
+  /* Notion location picker */
+  .loc-picker { display: flex; flex-direction: column; gap: 4px; }
+  .combo-list {
+    list-style: none;
+    margin: 2px 0 0;
+    padding: 4px 0;
+    max-height: 180px;
+    overflow-y: auto;
+    background: var(--ink);
+    border: 1px solid rgba(184, 137, 58, .6);
+    border-radius: 3px;
+  }
+  .combo-option {
+    display: flex; justify-content: space-between; align-items: center; gap: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  .combo-option.is-active, .combo-option:hover { background: rgba(184, 137, 58, .2); }
+  .combo-option[aria-selected=true] { color: var(--brass); }
+  .combo-option.is-none { font-style: italic; opacity: .8; }
+  .combo-note { padding: 4px 8px; font-size: 13px; opacity: .7; }
+  .loc-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 20px; }
+  .tag {
+    padding: 0 7px;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    font-size: 12px;
+    font-style: normal;
+    line-height: 18px;
+    white-space: nowrap;
+  }
+  .tag-public { color: #8fc79a; }
+  .tag-private { color: var(--rust); }
+  .tag-warn { color: #e6c35c; }
+  .tag-muted { color: rgba(232, 236, 239, .7); }
+  .leaflet-container a.loc-open { color: var(--brass); font-size: 13px; }
 
   .leaflet-control-layers {
     font-family: var(--font);

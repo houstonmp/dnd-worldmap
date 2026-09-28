@@ -2,7 +2,8 @@
    CONFIG: everything you'd normally tweak lives here.
    All images should share the same pixel size (width x height below).
    Leave a src as null to use a generated placeholder.
-   Places and fog live in places.json (edit them with ?edit on the URL).
+   Places, party and fog are stored by the map worker (edit with ?edit on the URL).
+   Place names, links and visibility come from Notion.
    ========================================================================== */
 const CONFIG = {
   width: 2560,                 // px width of your images
@@ -39,7 +40,8 @@ const CONFIG = {
     zoomIn: 1,                 // on load, zoom this far past the full-map view when centering on the party (0 = none)
   },
 
-  placesFile: 'places.json',   // pins, island names, party and fog; export a new one from edit mode
+  api: 'https://dnd-world-map-api.houston-mp.workers.dev',   // the map worker
+  placesFile: 'places.json',   // only read once: imported the first time the editor finds the worker empty
 
   startSpeed: 1,               // speed multiplier on load
   maxSpeed: 3,                 // top of the speed slider
@@ -187,7 +189,8 @@ const CanvasLayer = L.ImageOverlay.extend({
    ========================================================================== */
 const W = CONFIG.width, H = CONFIG.height;
 const EDIT = new URLSearchParams(location.search).has('edit');
-const DRAFT_KEY = 'drifting-isles:places-draft';
+const EDIT_KEY_STORAGE = 'dnd-map:edit-key';
+const UNSAVED_KEY = 'dnd-map:unsaved';
 
 const wrap01 = v => ((v % 1) + 1) % 1;
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -198,7 +201,6 @@ const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<':
 const placeType = key => PLACE_TYPES[key] || PLACE_TYPES[DEFAULT_PLACE_TYPE] || Object.values(PLACE_TYPES)[0];
 const placeTypeKey = key => (PLACE_TYPES[key] ? key : DEFAULT_PLACE_TYPE);
 const isFogTool = tool => tool === 'reveal' || tool === 'hide';
-const isPrivate = place => place.visibility === 'private';
 
 // Only allow real web links (blocks things like javascript: URLs)
 function safeUrl(value) {
@@ -417,9 +419,20 @@ if (CONFIG.fog.enabled) {
 }
 
 /* ==========================================================================
-   Data: pins, island names and fog, plus undo/redo
-   Coordinates are map pixels from the top-left.
-   Island name x is measured on the islands image, so it stays with its island.
+   Data
+   The worker stores the map. Players get a trimmed copy with only places linked
+   to Public Notion locations; the editor gets everything plus the Location list.
+
+   Saved shape (editor):
+     party:        { x, y } or null
+     pins:         [{ id, notionId, type, x, y, note, workingName }]
+     islandLabels: [{ id, notionId, x, y, workingName }]
+     fog:          [ ...operations ]
+   notionId is the Campaign Database page ID. workingName is an editor-only
+   placeholder for places that aren't linked yet; players never receive it.
+
+   Player shape: places arrive already joined with Notion
+     { id, x, y, name, url, pronunciation, aliases } (+ type, note for pins)
    ========================================================================== */
 const emptyData = () => ({ party: null, pins: [], islandLabels: [], fog: [] });
 const normalize = d => ({
@@ -429,10 +442,12 @@ const normalize = d => ({
   fog: Array.isArray(d?.fog) ? d.fog : [],
 });
 
-let deployed = emptyData();   // what's in places.json
-let data = emptyData();       // what's on screen (may be a draft)
+let data = emptyData();       // what's on screen
+let saved = emptyData();      // editor: the last version the worker confirmed
+let serverVersion = 0;        // editor: version of `saved` on the worker
+let locations = new Map();    // editor: notionId -> { id, name, url, public, pronunciation, aliases }
 let islandLabelEntries = [];
-let draftStorageFailed = false;
+let notionError = null;       // editor: last Notion sync problem reported by the worker
 
 const undoStack = { past: [], future: [] };
 const HISTORY_LIMIT = 200;
@@ -460,41 +475,203 @@ function redo() {
   commit();
 }
 
-// Save the draft and redraw. rebuildFog is skipped when the fog canvas is already up to date.
+// Redraw, and in the editor queue an autosave. rebuildFog is skipped when the fog canvas is already current.
 function commit({ rebuildFog = true } = {}) {
-  if (EDIT) {
-    try {
-      if (same(data, deployed)) localStorage.removeItem(DRAFT_KEY);
-      else localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
-      draftStorageFailed = false;
-    } catch {
-      draftStorageFailed = true;
-    }
-  }
+  if (EDIT) saver.schedule();
   if (rebuildFog && CONFIG.fog.enabled) Fog.rebuild(data.fog);
   renderPlaces();
   editPanel?.update();
 }
 
+/* ---- Talking to the worker ---- */
+function storageGet(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function storageSet(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getEditKey(ask = false) {
+  let key = ask ? null : storageGet(EDIT_KEY_STORAGE);
+  if (!key) {
+    key = (prompt('Enter the map edit key') || '').trim();
+    if (key) storageSet(EDIT_KEY_STORAGE, key);
+  }
+  return key || null;
+}
+
+async function api(path, { method = 'GET', body, auth = false } = {}) {
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (auth) headers.Authorization = `Bearer ${getEditKey()}`;
+  const res = await fetch(CONFIG.api.replace(/\/$/, '') + path, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    cache: 'no-store',
+  });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(payload.error || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  return payload;
+}
+
+// Editor requests: if the key is rejected, ask for it once and retry
+async function editorApi(path, options = {}) {
+  try {
+    return await api(path, { ...options, auth: true });
+  } catch (err) {
+    if (err.status !== 401) throw err;
+    storageSet(EDIT_KEY_STORAGE, null);
+    if (!getEditKey(true)) throw err;
+    return api(path, { ...options, auth: true });
+  }
+}
+
+/* ---- Autosave ----
+   Edits are saved as whole-map snapshots, but only after things settle:
+   a save waits until 1.5s after the last edit (and never more than 10s after
+   the first), so a burst of brush strokes or drags becomes one request.
+   Forms only change data when you press Save, so typing never triggers saves.
+   Unsaved changes are also kept in this browser until the worker confirms them. */
+const saver = (() => {
+  const DEBOUNCE_MS = 1500, MAX_WAIT_MS = 10000;
+  let timer = null, firstEditAt = 0, inFlight = false, retryMs = 2000;
+  let status = 'saved', message = '';
+
+  const dirty = () => !same(data, saved);
+  const set = (s, msg = '') => { status = s; message = msg; editPanel?.update(); };
+  const backup = () => storageSet(UNSAVED_KEY, dirty() ? JSON.stringify({ baseVersion: serverVersion, data }) : null);
+
+  function schedule() {
+    backup();
+    if (status === 'conflict') return;
+    if (!dirty()) {
+      clearTimeout(timer);
+      timer = null;
+      firstEditAt = 0;
+      if (!inFlight) set('saved');
+      return;
+    }
+    const now = Date.now();
+    if (!firstEditAt) firstEditAt = now;
+    clearTimeout(timer);
+    timer = setTimeout(flush, Math.max(0, Math.min(DEBOUNCE_MS, firstEditAt + MAX_WAIT_MS - now)));
+    if (!inFlight) set('pending');
+  }
+
+  async function flush() {
+    clearTimeout(timer);
+    timer = null;
+    if (inFlight || status === 'conflict' || !dirty()) return;
+    firstEditAt = 0;
+    inFlight = true;
+    const snapshot = structuredClone(data);
+    set('saving');
+    try {
+      const res = await editorApi('/map', { method: 'PUT', body: { baseVersion: serverVersion, data: snapshot } });
+      serverVersion = res.version;
+      saved = snapshot;
+      retryMs = 2000;
+      backup();
+      set(dirty() ? 'pending' : 'saved');
+    } catch (err) {
+      if (err.status === 409) {
+        set('conflict', 'The map was saved from another tab or device. Reload to get the latest; your version is kept as a backup in this browser.');
+      } else {
+        set('error', `Couldn't save (${err.message}). Retrying in ${Math.round(retryMs / 1000)}s.`);
+        timer = setTimeout(flush, retryMs);
+        retryMs = Math.min(retryMs * 2, 60000);
+      }
+    } finally {
+      inFlight = false;
+      if (dirty() && status === 'pending') schedule();   // edits made while this save was in flight
+    }
+  }
+
+  return {
+    schedule,
+    flush,
+    dirty,
+    get status() { return status; },
+    get message() { return message; },
+    fail(msg) { set('error', msg); },
+  };
+})();
+
+/* ---- Loading ---- */
+const nameKey = s => String(s || '').normalize('NFKD').replace(/[\u2018\u2019\u201C\u201D"']/g, '')
+  .replace(/\s+/g, ' ').trim().toLowerCase();
+
+// Older places.json entries stored names instead of Notion IDs. Link exact name matches;
+// keep anything else as an unlinked place with its old name as the working name.
+function migrateLegacy(d) {
+  const byName = new Map([...locations.values()].map(l => [nameKey(l.name), l.id]));
+  const fix = place => {
+    const out = { ...place };
+    if (!out.notionId && out.name) {
+      const match = byName.get(nameKey(out.name));
+      if (match) out.notionId = match;
+      else out.workingName = out.workingName || out.name;
+    }
+    out.notionId = out.notionId || null;
+    delete out.name;
+    delete out.link;
+    delete out.visibility;
+    return out;
+  };
+  return { ...d, pins: d.pins.map(fix), islandLabels: d.islandLabels.map(fix) };
+}
+
+async function loadEditor() {
+  const res = await editorApi('/editor');
+  locations = new Map(res.locations.map(l => [l.id, l]));
+  notionError = res.syncError || null;
+  serverVersion = res.map.version;
+  saved = normalize(res.map.data);
+  data = migrateLegacy(structuredClone(saved));
+
+  // First run: the worker is empty, so bring in the old places.json if there is one
+  if (serverVersion === 0 && !data.pins.length && !data.islandLabels.length && !data.fog.length) {
+    try {
+      const file = await fetch(CONFIG.placesFile, { cache: 'no-store' });
+      if (file.ok) data = migrateLegacy(normalize(await file.json()));
+    } catch { /* nothing to import */ }
+  }
+
+  // Changes that never made it to the worker last time
+  const raw = storageGet(UNSAVED_KEY);
+  if (raw) {
+    try {
+      const backup = JSON.parse(raw);
+      const draft = normalize(backup.data);
+      if (same(draft, saved)) storageSet(UNSAVED_KEY, null);
+      else if (backup.baseVersion === serverVersion ||
+        confirm('This browser has unsaved map changes, but the saved map has changed since.\n\nOK: load your unsaved changes (they replace the saved map).\nCancel: keep the saved map.')) {
+        data = draft;
+      } else {
+        storageSet(UNSAVED_KEY, null);
+      }
+    } catch { /* unreadable backup */ }
+  }
+}
+
 async function loadData() {
   try {
-    const res = await fetch(CONFIG.placesFile, { cache: 'no-store' });
-    if (res.ok) deployed = normalize(await res.json());
-    else console.warn(`${CONFIG.placesFile} returned ${res.status}; starting empty.`);
+    if (EDIT) await loadEditor();
+    else data = normalize(await api('/map'));
   } catch (err) {
-    console.warn(`Couldn't load ${CONFIG.placesFile}; starting empty.`, err);
-  }
-  data = structuredClone(deployed);
-
-  if (EDIT) {
-    try {
-      const raw = localStorage.getItem(DRAFT_KEY);
-      if (raw) {
-        const draft = normalize(JSON.parse(raw));
-        if (same(draft, deployed)) localStorage.removeItem(DRAFT_KEY);
-        else data = draft;
-      }
-    } catch { /* no draft available */ }
+    console.error(err);
+    if (EDIT) saver.fail(`Couldn't load the map from the worker (${err.message}).`);
   }
   commit();
   centerOnParty();
@@ -509,16 +686,38 @@ function centerOnParty() {
 /* ==========================================================================
    Places: fixed pins + drifting island names
    ========================================================================== */
+
+// Name, link and status of a place. Players' places arrive pre-joined; the editor joins with Notion here.
+function placeInfo(place) {
+  if (!EDIT) return { ...place, status: 'public' };
+  const loc = place.notionId ? locations.get(place.notionId) : null;
+  if (loc) return { ...loc, status: loc.public ? 'public' : 'private' };
+  if (place.notionId) return { name: place.workingName || 'Missing Notion page', status: 'missing' };
+  return { name: place.workingName || 'Unlinked location', status: 'unlinked' };
+}
+
 function pinIcon(pin) {
   const t = placeType(pin.type);
+  const info = placeInfo(pin);
+  const tag = info.status === 'public' ? '' : ` data-tag="${info.status}"`;
   const box = t.dotSize + 6;
   return L.divIcon({
-    className: `place-pin${isPrivate(pin) ? ' is-private' : ''}`,
+    className: `place-pin${tag ? ' is-flagged' : ''}`,
     html: `<span class="dot" style="width:${t.dotSize}px;height:${t.dotSize}px;background:${t.color}"></span>` +
-          `<span class="name" style="left:${box + 4}px;font-size:${t.fontSize}px">${escapeHtml(pin.name)}</span>`,
+          `<span class="name"${tag} style="left:${box + 4}px;font-size:${t.fontSize}px">${escapeHtml(info.name)}</span>`,
     iconSize: [box, box],
     iconAnchor: [box / 2, box / 2],
     popupAnchor: [0, -box / 2],
+  });
+}
+
+function labelIcon(label) {
+  const info = placeInfo(label);
+  const tag = info.status === 'public' ? '' : ` data-tag="${info.status}"`;
+  return L.divIcon({
+    className: `island-label${tag ? ' is-flagged' : ''}${!EDIT && safeUrl(info.url) ? ' has-link' : ''}`,
+    html: `<span${tag}>${escapeHtml(info.name)}</span>`,
+    iconSize: null,
   });
 }
 
@@ -551,29 +750,33 @@ function renderParty() {
   marker.addTo(partyLayer);
 }
 
-const labelIcon = label => L.divIcon({
-  className: `island-label${isPrivate(label) ? ' is-private' : ''}${!EDIT && safeUrl(label.link) ? ' has-link' : ''}`,
-  html: `<span>${escapeHtml(label.name)}</span>`,
-  iconSize: null,
-});
-
-// What players see when they click a place
+// What players see when they click a place, e.g. "City・(New Shey-gaas)"
 function viewPopup(place, kindLabel) {
+  const info = placeInfo(place);
   const el = document.createElement('div');
+
   const name = document.createElement('div');
   name.className = 'popup-name';
-  name.textContent = place.name;
+  name.textContent = info.name;
+
   const kind = document.createElement('div');
   kind.className = 'popup-kind';
-  kind.textContent = kindLabel;
+  kind.textContent = info.pronunciation ? `${kindLabel}・(${info.pronunciation})` : kindLabel;
   el.append(name, kind);
+
+  if (info.aliases) {
+    const aliases = document.createElement('div');
+    aliases.className = 'popup-aliases';
+    aliases.textContent = `Also known as ${info.aliases}`;
+    el.append(aliases);
+  }
   if (place.note) {
     const note = document.createElement('p');
     note.className = 'popup-note';
     note.textContent = place.note;
     el.append(note);
   }
-  const href = safeUrl(place.link);
+  const href = safeUrl(info.url);
   if (href) {
     const link = document.createElement('a');
     link.className = 'popup-link';
@@ -595,8 +798,8 @@ function renderPlaces() {
   const editingPlaces = EDIT && editor.tool === 'places';
 
   data.pins.forEach(pin => {
-    // Players don't get private pins, or pins that are still under the fog
-    if (!EDIT && (isPrivate(pin) || (CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)))) return;
+    // Players only receive public places; also skip any still under the fog
+    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
 
     const marker = L.marker([H - pin.y, pin.x], {
       pane: 'pins',
@@ -620,8 +823,7 @@ function renderPlaces() {
   });
 
   data.islandLabels.forEach(label => {
-    if (!EDIT && isPrivate(label)) return;
-    const playerLink = !EDIT && safeUrl(label.link);
+    const playerLink = !EDIT && safeUrl(label.url);
     const marker = L.marker([H - label.y, label.x], {
       pane: 'labels',
       interactive: editingPlaces || !!playerLink,
@@ -708,7 +910,172 @@ const editor = {
 let editPanel = null;
 let lastType = 'pin';
 let lastKind = placeTypeKey(DEFAULT_PLACE_TYPE);
-let lastVisibility = 'public';
+
+/* ---- Notion location picker ----
+   A searchable dropdown (combobox). By default it lists only locations that
+   aren't on the map yet; a checkbox brings the linked ones back.
+   Type to filter by name or alias; arrows + Enter or the mouse to pick. */
+let pickerCount = 0;
+const PICKER_LIMIT = 50;   // rows rendered at once; typing narrows the rest
+
+function locationPicker(currentPlace, onChange) {
+  const uid = `loc-picker-${++pickerCount}`;
+  const root = document.createElement('div');
+  root.className = 'loc-picker';
+  root.innerHTML = `
+    <label for="${uid}-input">Notion location</label>
+    <div class="combo">
+      <input id="${uid}-input" class="combo-input" type="text" role="combobox"
+        aria-autocomplete="list" aria-expanded="false" aria-controls="${uid}-list"
+        autocomplete="off" spellcheck="false" placeholder="Not linked yet · type to search">
+      <ul id="${uid}-list" class="combo-list" role="listbox" hidden></ul>
+    </div>
+    <label class="inline"><input type="checkbox" data-include-linked> Include places already on the map</label>
+    <div class="loc-tags" data-tags></div>`;
+
+  const input = root.querySelector('.combo-input');
+  const list = root.querySelector('.combo-list');
+  const includeLinked = root.querySelector('[data-include-linked]');
+  const tags = root.querySelector('[data-tags]');
+
+  let selected = currentPlace?.notionId || null;
+  let query = '';
+  let shown = [];
+  let active = -1;
+
+  const onMapElsewhere = id =>
+    [...data.pins, ...data.islandLabels].some(p => p !== currentPlace && p.notionId === id);
+  const labelFor = id => (id ? locations.get(id)?.name || 'Missing Notion page' : '');
+
+  function matches() {
+    const q = nameKey(query);
+    return [...locations.values()].filter(loc =>
+      (includeLinked.checked || loc.id === selected || !onMapElsewhere(loc.id)) &&
+      (!q || nameKey(loc.name).includes(q) || nameKey(loc.aliases).includes(q)));
+  }
+
+  function row(text, className) {
+    const li = document.createElement('li');
+    li.className = className;
+    li.textContent = text;
+    return li;
+  }
+
+  function render() {
+    const found = matches();
+    shown = [{ id: null, name: 'Not linked yet' }, ...found.slice(0, PICKER_LIMIT)];
+    list.replaceChildren();
+    shown.forEach((opt, i) => {
+      const li = row(opt.name, `combo-option${opt.id ? '' : ' is-none'}`);
+      li.id = `${uid}-opt-${i}`;
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', String(opt.id === selected));
+      if (opt.id && onMapElsewhere(opt.id)) {
+        const tag = document.createElement('span');
+        tag.className = 'tag tag-muted';
+        tag.textContent = 'on map';
+        li.append(tag);
+      }
+      // pointerdown + preventDefault keeps focus in the input, so the list doesn't close first
+      li.addEventListener('pointerdown', e => { e.preventDefault(); choose(opt.id); });
+      list.append(li);
+    });
+    if (!found.length) list.append(row(query ? 'No matching locations' : 'Every location is already on the map', 'combo-note'));
+    if (found.length > PICKER_LIMIT) list.append(row(`${found.length - PICKER_LIMIT} more · keep typing to narrow it down`, 'combo-note'));
+    setActive(clamp(active, 0, shown.length - 1));
+  }
+
+  function setActive(i) {
+    active = i;
+    list.querySelectorAll('.combo-option').forEach((li, n) => li.classList.toggle('is-active', n === i));
+    const li = list.querySelector(`#${uid}-opt-${i}`);
+    if (li) {
+      input.setAttribute('aria-activedescendant', li.id);
+      li.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function open() {
+    if (!list.hidden) return;
+    list.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    active = -1;
+    render();
+    setActive(Math.max(0, shown.findIndex(o => o.id === selected)));
+  }
+
+  function close() {
+    list.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+    query = '';
+    input.value = labelFor(selected);
+  }
+
+  function choose(id) {
+    selected = id;
+    close();
+    renderTags();
+    onChange(id);
+  }
+
+  function renderTags() {
+    tags.replaceChildren();
+    const add = (text, cls) => {
+      const s = document.createElement('span');
+      s.className = `tag ${cls}`;
+      s.textContent = text;
+      tags.append(s);
+    };
+    if (!selected) return add('Not linked', 'tag-muted');
+    const loc = locations.get(selected);
+    if (!loc) return add('Missing in Notion', 'tag-warn');
+    add(loc.public ? 'Public' : 'Private', loc.public ? 'tag-public' : 'tag-private');
+    if (onMapElsewhere(selected)) add('Also on map', 'tag-muted');
+    const href = safeUrl(loc.url);
+    if (href) {
+      const a = document.createElement('a');
+      a.className = 'loc-open';
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = 'Open in Notion ↗';
+      tags.append(a);
+    }
+  }
+
+  input.addEventListener('focus', () => input.select());
+  input.addEventListener('click', open);
+  input.addEventListener('blur', close);
+  input.addEventListener('input', () => {
+    query = input.value;
+    if (list.hidden) open();
+    active = shown.length > 1 ? 1 : 0;   // jump to the first real match while typing
+    render();
+  });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (list.hidden) open();
+      else setActive(Math.min(active + 1, shown.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!list.hidden) setActive(Math.max(active - 1, 0));
+    } else if (e.key === 'Enter' && !list.hidden) {
+      e.preventDefault();   // pick instead of submitting the form
+      choose(shown[active] ? shown[active].id : selected);
+    } else if (e.key === 'Escape' && !list.hidden) {
+      e.preventDefault();
+      e.stopPropagation();  // close the list, not the popup
+      close();
+    }
+  });
+  includeLinked.addEventListener('change', () => { input.focus(); open(); render(); });
+
+  input.value = labelFor(selected);
+  renderTags();
+  return { root, input, get value() { return selected; } };
+}
 
 function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
   const kindOptions = Object.entries(PLACE_TYPES)
@@ -718,62 +1085,57 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
   form.className = 'place-form';
   form.innerHTML = `
     <h3></h3>
-    <label>Name <input type="text" name="name" required autocomplete="off"></label>
+    <div data-picker></div>
+    <label class="unlinked-only">Working name <input type="text" name="workingName" autocomplete="off" placeholder="Optional, editor only"></label>
     ${allowType ? `
       <fieldset>
         <label><input type="radio" name="type" value="pin"> Fixed pin on the map</label>
         <label><input type="radio" name="type" value="island"> Island name (drifts)</label>
       </fieldset>` : ''}
     <label class="pin-only">Kind <select name="kind">${kindOptions}</select></label>
-    <label class="pin-only">Note <textarea name="note" rows="3"></textarea></label>
-    <label>Link <input type="url" name="link" placeholder="https://…" autocomplete="off"></label>
-    <label>Visibility
-      <select name="visibility">
-        <option value="public">Public: players see it</option>
-        <option value="private">Private: editor only</option>
-      </select>
-    </label>
+    <label class="pin-only">Map description <textarea name="note" rows="3"></textarea></label>
     <div class="row">
       <button type="submit" class="btn primary">Save</button>
       ${onDelete ? '<button type="button" class="btn danger" data-delete>Delete</button>' : ''}
     </div>`;
 
   form.querySelector('h3').textContent = heading;
-  form.elements.name.value = place.name || '';
+  const picker = locationPicker(place.id ? place : null, () => sync());
+  form.querySelector('[data-picker]').replaceWith(picker.root);
+  form.elements.workingName.value = place.workingName || '';
   form.elements.note.value = place.note || '';
   form.elements.kind.value = place.type ? placeTypeKey(place.type) : lastKind;
-  form.elements.link.value = place.link || '';
-  form.elements.visibility.value = place.visibility || (place.id ? 'public' : lastVisibility);
 
   const currentType = () => (allowType ? form.elements.type.value : (isPin ? 'pin' : 'island'));
-  const syncFields = () => form.querySelectorAll('.pin-only').forEach(el => { el.hidden = currentType() !== 'pin'; });
+  const sync = () => {
+    form.querySelectorAll('.pin-only').forEach(el => { el.hidden = currentType() !== 'pin'; });
+    form.querySelector('.unlinked-only').hidden = !!picker.value;
+  };
   if (allowType) {
     form.elements.type.value = lastType;
-    form.querySelectorAll('input[name=type]').forEach(r => r.addEventListener('change', syncFields));
+    form.querySelectorAll('input[name=type]').forEach(r => r.addEventListener('change', sync));
   }
-  syncFields();
+  sync();
 
   form.addEventListener('submit', e => {
     e.preventDefault();
-    const name = form.elements.name.value.trim();
-    if (!name) return;
     onSave({
-      name,
+      notionId: picker.value,
+      workingName: form.elements.workingName.value.trim(),
       note: form.elements.note.value.trim(),
       kind: form.elements.kind.value,
       type: currentType(),
-      link: form.elements.link.value.trim(),
-      visibility: form.elements.visibility.value,
     });
   });
   form.querySelector('[data-delete]')?.addEventListener('click', onDelete);
   L.DomEvent.disableClickPropagation(form);
+  L.DomEvent.disableScrollPropagation(form);
   return form;
 }
 
 function openPopup(latlng, form) {
-  L.popup({ minWidth: 220, maxWidth: 260 }).setLatLng(latlng).setContent(form).openOn(map);
-  setTimeout(() => form.elements.name.focus(), 0);
+  L.popup({ minWidth: 230, maxWidth: 270 }).setLatLng(latlng).setContent(form).openOn(map);
+  setTimeout(() => form.querySelector('.combo-input').focus(), 0);
 }
 
 function openAddPopup(latlng) {
@@ -785,15 +1147,14 @@ function openAddPopup(latlng) {
     heading: 'New place',
     place: {},
     allowType: true,
-    onSave: ({ name, note, kind, type, link, visibility }) => {
+    onSave: ({ notionId, workingName, note, kind, type }) => {
       lastType = type;
-      lastVisibility = visibility;
       change(() => {
         if (type === 'island') {
-          data.islandLabels.push({ id: newId(), name, x: Math.round(islandX), y, link, visibility });
+          data.islandLabels.push({ id: newId(), notionId, x: Math.round(islandX), y, workingName });
         } else {
           lastKind = kind;
-          data.pins.push({ id: newId(), name, type: kind, x: Math.round(latlng.lng), y, note, link, visibility });
+          data.pins.push({ id: newId(), notionId, type: kind, x: Math.round(latlng.lng), y, note, workingName });
         }
       }, { rebuildFog: false });
     },
@@ -807,11 +1168,10 @@ function openEditPopup(marker, place, listKey) {
     place,
     isPin,
     allowType: false,
-    onSave: ({ name, note, kind, link, visibility }) => {
+    onSave: ({ notionId, workingName, note, kind }) => {
       change(() => {
-        place.name = name;
-        place.link = link;
-        place.visibility = visibility;
+        place.notionId = notionId;
+        place.workingName = workingName;
         if (isPin) {
           place.note = note;
           place.type = kind;
@@ -820,7 +1180,7 @@ function openEditPopup(marker, place, listKey) {
       }, { rebuildFog: false });
     },
     onDelete: () => {
-      if (!confirm(`Delete "${place.name}"?`)) return;
+      if (!confirm(`Delete "${placeInfo(place).name}" from the map? (The Notion page isn't touched.)`)) return;
       change(() => { data[listKey] = data[listKey].filter(p => p.id !== place.id); }, { rebuildFog: false });
     },
   }));
@@ -920,6 +1280,14 @@ function finishDrawing(e) {
 if (EDIT) {
   container.classList.add('editing');
 
+  // Save right away when the tab is hidden, and warn before closing with unsaved changes
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') saver.flush();
+  });
+  window.addEventListener('beforeunload', e => {
+    if (saver.dirty()) { e.preventDefault(); e.returnValue = ''; }
+  });
+
   // A click that only closes an open popup shouldn't also start a new place
   let lastPopupClose = 0;
   map.on('popupclose', () => { lastPopupClose = performance.now(); });
@@ -1002,17 +1370,16 @@ if (EDIT) {
         <hr>
         <p data-count></p>
         <p class="muted" data-status role="status"></p>
+        <p class="notion-error" data-notion-error role="alert"></p>
         <div class="row">
-          <button type="button" class="btn primary" data-export>Export places.json</button>
-          <button type="button" class="btn" data-copy>Copy JSON</button>
-        </div>
-        <div class="row"><button type="button" class="btn danger" data-discard>Discard draft</button></div>`;
+          <button type="button" class="btn" data-sync>Sync from Notion</button>
+          <button type="button" class="btn" data-backup>Download backup</button>
+        </div>`;
       L.DomEvent.disableClickPropagation(panel);
       L.DomEvent.disableScrollPropagation(panel);
       L.DomEvent.on(panel, 'pointerdown', L.DomEvent.stopPropagation);
 
       const $ = sel => panel.querySelector(sel);
-      const json = () => JSON.stringify(data, null, 2) + '\n';
 
       panel.querySelectorAll('[data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
       panel.querySelectorAll('[data-shape]').forEach(b => b.addEventListener('click', () => {
@@ -1039,31 +1406,40 @@ if (EDIT) {
         fogLayer.setOpacity(editor.showPlayerFog ? CONFIG.fog.opacity : CONFIG.fog.editorOpacity);
       });
 
-      $('[data-export]').addEventListener('click', () => {
-        const url = URL.createObjectURL(new Blob([json()], { type: 'application/json' }));
+      const syncBtn = $('[data-sync]');
+      syncBtn.addEventListener('click', async () => {
+        syncBtn.disabled = true;
+        syncBtn.textContent = 'Syncing…';
+        try {
+          const res = await editorApi('/sync', { method: 'POST' });
+          locations = new Map(res.locations.map(l => [l.id, l]));
+          notionError = null;
+          renderPlaces();
+          syncBtn.textContent = `Synced ${res.locations.length}`;
+        } catch (err) {
+          notionError = err.message;
+          syncBtn.textContent = 'Sync failed';
+          console.error(err);
+        }
+        setTimeout(() => { syncBtn.textContent = 'Sync from Notion'; syncBtn.disabled = false; }, 1500);
+        this.update();
+      });
+
+      $('[data-backup]').addEventListener('click', () => {
+        const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'places.json';
+        a.download = `map-backup-${new Date().toISOString().slice(0, 10)}.json`;
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       });
 
-      const copyBtn = $('[data-copy]');
-      copyBtn.addEventListener('click', async () => {
-        try {
-          await navigator.clipboard.writeText(json());
-          copyBtn.textContent = 'Copied';
-        } catch {
-          copyBtn.textContent = 'Copy blocked';
-        }
-        setTimeout(() => { copyBtn.textContent = 'Copy JSON'; }, 1500);
-      });
-
-      const discardBtn = $('[data-discard]');
-      discardBtn.addEventListener('click', () => {
-        if (!confirm('Go back to the deployed places.json? You can still undo this.')) return;
-        change(() => { data = structuredClone(deployed); });
-      });
+      const STATUS_TEXT = {
+        saved: 'All changes saved.',
+        pending: 'Unsaved changes…',
+        saving: 'Saving…',
+      };
 
       this.update = () => {
         panel.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === editor.tool));
@@ -1078,20 +1454,21 @@ if (EDIT) {
         $('[data-undo]').disabled = !undoStack.past.length;
         $('[data-redo]').disabled = !undoStack.future.length;
 
-        const p = data.pins.length, l = data.islandLabels.length, f = data.fog.length;
-        const priv = [...data.pins, ...data.islandLabels].filter(isPrivate).length;
+        const places = [...data.pins, ...data.islandLabels];
+        const count = s => places.filter(p => placeInfo(p).status === s).length;
+        const flags = [
+          count('unlinked') && `${count('unlinked')} unlinked`,
+          count('private') && `${count('private')} private`,
+          count('missing') && `${count('missing')} missing in Notion`,
+        ].filter(Boolean);
+        const p = data.pins.length, l = data.islandLabels.length;
         $('[data-count]').textContent =
           `${p} ${p === 1 ? 'pin' : 'pins'}, ${l} island ${l === 1 ? 'name' : 'names'}` +
-          (priv ? ` (${priv} private)` : '') +
-          (CONFIG.fog.enabled ? `, ${f} fog ${f === 1 ? 'edit' : 'edits'}` : '');
+          (flags.length ? ` (${flags.join(', ')})` : '') + `. ${locations.size} Notion locations.`;
 
-        const isDraft = !same(data, deployed);
-        $('[data-status]').textContent = draftStorageFailed
-          ? "This browser won't keep a draft here. Export before closing the page."
-          : isDraft
-            ? 'Draft saved in this browser. Export and redeploy to publish it.'
-            : 'Matches the deployed places.json.';
-        discardBtn.disabled = !isDraft;
+        $('[data-status]').textContent = STATUS_TEXT[saver.status] || saver.message;
+        $('[data-notion-error]').hidden = !notionError;
+        $('[data-notion-error]').textContent = notionError ? `Notion sync failed: ${notionError}` : '';
       };
       return panel;
     },
