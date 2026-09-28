@@ -27,7 +27,6 @@ const PROPS = {
   aliases: 'Aliases',
 };
 const LOCATION_TAG = 'location';   // matched case-insensitively
-const PUBLIC_VALUE = 'public';     // Visibility value that players can see
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 
@@ -166,6 +165,8 @@ function names(prop) {
   if (!prop) return [];
   if (prop.type === 'select' || prop.type === 'status') return prop[prop.type] ? [prop[prop.type].name] : [];
   if (prop.type === 'multi_select') return prop.multi_select.map(o => o.name);
+  // Visibility is a "show original" rollup from the DM Database: an array of select values
+  if (prop.type === 'rollup' && prop.rollup.type === 'array') return prop.rollup.array.flatMap(names);
   return [];
 }
 
@@ -181,12 +182,16 @@ function toLocation(page) {
   const tags = names(props[PROPS.tags]).map(t => t.toLowerCase());
   if (!tags.includes(LOCATION_TAG)) return null;
   const titleProp = Object.values(props).find(p => p.type === 'title');
-  const visibility = (names(props[PROPS.visibility])[0] || '').toLowerCase();
+  // Exactly one "Public" or "Private" from the rollup; anything else (no DM page linked,
+  // several linked, another value) is reported as unknown rather than guessed
+  const values = names(props[PROPS.visibility]).map(v => v.toLowerCase());
+  const visibility = values.length === 1 && (values[0] === 'public' || values[0] === 'private') ? values[0] : 'unknown';
   return {
     id: cleanId(page.id),
     name: text(titleProp) || 'Untitled',
     url: page.url,
-    public: visibility === PUBLIC_VALUE,
+    visibility,                           // 'public' | 'private' | 'unknown' (editor only)
+    public: visibility === 'public',      // players only ever get these
     pronunciation: text(props[PROPS.pronunciation]),
     aliases: text(props[PROPS.aliases]),
   };
