@@ -1,0 +1,18 @@
+name = "dnd-world-map-api"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+# Create it with: npx wrangler kv namespace create MAP_KV
+[[kv_namespaces]]
+binding = "MAP_KV"
+id = "8f960819e7dd4d80b47d421feda84b47"
+
+[vars]
+# The Campaign Database (from its URL). The worker looks up its data source itself.
+NOTION_DATABASE_ID = "29d69af4bcec819ea5c9c55acaf8e8f8"
+# Where the map is served from, comma-separated. Include your local dev address.
+ALLOWED_ORIGINS = "https://dnd-worldmap.netlify.app,http://localhost:3000"
+
+# Backup sync in case a webhook is ever missed
+[triggers]
+crons = ["0 */6 * * *"]
