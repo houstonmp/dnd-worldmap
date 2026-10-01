@@ -53,10 +53,9 @@ const CONFIG = {
 };
 
 /* ==========================================================================
-   PLACE_TYPES: the kinds of pins you can pick in edit mode.
-   Add, remove or reorder freely. The key (e.g. city) is what's saved in
-   places.json, so rename a key only if you also update existing pins.
-   dotSize and fontSize are in screen pixels.
+   PLACE_TYPES: the starting set of pin kinds. Once you save place types from
+   the editor's Settings (gear icon), those are stored with the map and used
+   instead, for players too. dotSize and fontSize are in screen pixels.
    ========================================================================== */
 const PLACE_TYPES = {
   continent: { label: 'Continent', color: '#3f6f8f', dotSize: 14, fontSize: 22 },
@@ -65,7 +64,7 @@ const PLACE_TYPES = {
   town:      { label: 'Town',      color: '#4f7a4a', dotSize: 8,  fontSize: 14 },
   hamlet:    { label: 'Hamlet',    color: '#9a9ea3', dotSize: 6,  fontSize: 13 },
 };
-const DEFAULT_PLACE_TYPE = 'town';   // used for new pins and for pins whose type was removed
+const DEFAULT_PLACE_TYPE = 'town';   // starting default for new pins (changeable in Settings)
 
 /* ==========================================================================
    Placeholder art (only used when a src above is null)
@@ -192,7 +191,13 @@ const CanvasLayer = L.ImageOverlay.extend({
    Helpers
    ========================================================================== */
 const W = CONFIG.width, H = CONFIG.height;
-const EDIT = new URLSearchParams(location.search).has('edit');
+// Three ways to open the map:
+//   (no param)  Player view: the real thing, public places only, no key needed
+//   ?preview    Preview: the player view with every place included (edit key required)
+//   ?edit       Editor (edit key required)
+const PARAMS = new URLSearchParams(location.search);
+const EDIT = PARAMS.has('edit');
+const PREVIEW = !EDIT && PARAMS.has('preview');
 const EDIT_KEY_STORAGE = 'dnd-map:edit-key';
 const UNSAVED_KEY = 'dnd-map:unsaved';
 
@@ -202,8 +207,20 @@ const clampLatLng = ll => L.latLng(clamp(ll.lat, 0, H), clamp(ll.lng, 0, W));
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const newId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
 const escapeHtml = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const placeType = key => PLACE_TYPES[key] || PLACE_TYPES[DEFAULT_PLACE_TYPE] || Object.values(PLACE_TYPES)[0];
-const placeTypeKey = key => (PLACE_TYPES[key] ? key : DEFAULT_PLACE_TYPE);
+// Place types: the list saved in Settings, or the starting set from PLACE_TYPES
+const STARTING_PLACE_TYPES = Object.entries(PLACE_TYPES).map(([key, t]) => ({ key, ...t }));
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+function placeTypes() {
+  const saved = data.settings?.placeTypes;
+  return Array.isArray(saved) && saved.length ? saved : STARTING_PLACE_TYPES;
+}
+function defaultPlaceType() {
+  const types = placeTypes();
+  return types.find(t => t.key === data.settings?.defaultPlaceType) ||
+    types.find(t => t.key === DEFAULT_PLACE_TYPE) || types[0];
+}
+const placeType = key => placeTypes().find(t => t.key === key) || defaultPlaceType();
+const placeTypeKey = key => (placeTypes().some(t => t.key === key) ? key : defaultPlaceType().key);
 const isFogTool = tool => tool === 'reveal' || tool === 'hide';
 
 // Only allow real web links (blocks things like javascript: URLs)
@@ -246,7 +263,7 @@ const clouds = new ScrollingLayer(CONFIG.clouds.src || placeholderClouds(), boun
 }).addTo(map);
 
 const pinLayer = L.layerGroup().addTo(map);
-const islandLabelLayer = L.layerGroup().addTo(map);
+const islandLabelLayer = L.layerGroup().addTo(map);   // places on sky islands (they drift)
 const partyLayer = L.layerGroup().addTo(map);   // always shown, so it's not in the layers menu
 
 map.fitBounds(bounds);
@@ -255,9 +272,9 @@ map.setMinZoom(map.getZoom() - 0.5);
 map.setMaxBounds(L.latLngBounds(bounds).pad(0.15));
 
 // Fog is deliberately left out of this menu so players can't turn it off
-L.control.layers(null, {
+const layersControl = L.control.layers(null, {
   'Drifting isles': islands,
-  'Island names': islandLabelLayer,
+  'Sky island places': islandLabelLayer,
   'Places': pinLayer,
   'Clouds': clouds,
 }, { collapsed: true }).addTo(map);
@@ -429,17 +446,22 @@ if (CONFIG.fog.enabled) {
 
    Saved shape (editor):
      party:        { x, y } or null
-     pins:         [{ id, notionId, type, x, y, note, workingName }]
-     islandLabels: [{ id, notionId, x, y, workingName }]
+     pins:         [{ id, notionId, type, x, y, note, workingName, subLocations: [notionId], drifts }]
+       drifts: true = the place is on a sky island and moves with it; its x is
+       measured on the islands image instead of the base map. Everything else
+       about a drifting place is identical to a fixed one.
+     islandLabels: [] (older format; converted into drifting pins on load)
      fog:          [ ...operations ]
    notionId is the Campaign Database page ID. workingName is an editor-only
    placeholder for places that aren't linked yet; players never receive it.
 
    Player shape: places arrive already joined with Notion
-     { id, x, y, name, url, pronunciation, aliases } (+ type, note for pins)
+     { id, x, y, name, url, pronunciation, aliases } (+ type, note, subLocations for pins)
+   Pins' subLocations arrive as [{ id, name, url, pronunciation }], public ones only.
    ========================================================================== */
-const emptyData = () => ({ party: null, pins: [], islandLabels: [], fog: [] });
+const emptyData = () => ({ party: null, pins: [], islandLabels: [], fog: [], settings: {} });
 const normalize = d => ({
+  settings: d?.settings && typeof d.settings === 'object' && !Array.isArray(d.settings) ? d.settings : {},
   party: Number.isFinite(d?.party?.x) && Number.isFinite(d?.party?.y) ? { x: d.party.x, y: d.party.y } : null,
   pins: Array.isArray(d?.pins) ? d.pins : [],
   islandLabels: Array.isArray(d?.islandLabels) ? d.islandLabels : [],
@@ -450,7 +472,7 @@ let data = emptyData();       // what's on screen
 let saved = emptyData();      // editor: the last version the worker confirmed
 let serverVersion = 0;        // editor: version of `saved` on the worker
 let locations = new Map();    // editor: notionId -> { id, name, url, public, pronunciation, aliases }
-let islandLabelEntries = [];
+let islandLabelEntries = [];   // drifting pins: { place, marker, dragging }, repositioned every frame
 let pinMarkers = new Map();   // pin id -> marker, so search can find it
 let partyMarker = null;
 let notionError = null;       // editor: last Notion sync problem reported by the worker
@@ -635,7 +657,11 @@ function migrateLegacy(d) {
     delete out.visibility;
     return out;
   };
-  return { ...d, pins: d.pins.map(fix), islandLabels: d.islandLabels.map(fix) };
+  // Older island names become drifting pins with every field a pin has
+  const fromIslands = d.islandLabels.map(label => ({
+    ...fix(label), type: label.type, note: label.note || '', subLocations: label.subLocations || [], drifts: true,
+  }));
+  return { ...d, pins: [...d.pins.map(fix), ...fromIslands], islandLabels: [] };
 }
 
 async function loadEditor() {
@@ -674,6 +700,7 @@ async function loadEditor() {
 async function loadData() {
   try {
     if (EDIT) await loadEditor();
+    else if (PREVIEW) data = normalize(await editorApi('/preview'));
     else data = normalize(await api('/map'));
   } catch (err) {
     console.error(err);
@@ -693,13 +720,46 @@ function centerOnParty() {
    Places: fixed pins + drifting island names
    ========================================================================== */
 
+// Editor: a Notion location plus its status ('public' | 'private' | 'visibility unknown'), or null
+function locationInfo(id) {
+  const loc = id ? locations.get(id) : null;
+  if (!loc) return null;
+  return { ...loc, status: loc.public ? 'public' : loc.visibility === 'private' ? 'private' : 'visibility unknown' };
+}
+
 // Name, link and status of a place. Players' places arrive pre-joined; the editor joins with Notion here.
 function placeInfo(place) {
   if (!EDIT) return { ...place, status: 'public' };
-  const loc = place.notionId ? locations.get(place.notionId) : null;
-  if (loc) return { ...loc, status: loc.public ? 'public' : 'private' };
+  const loc = locationInfo(place.notionId);
+  if (loc) return loc;
   if (place.notionId) return { name: place.workingName || 'Missing Notion page', status: 'missing' };
   return { name: place.workingName || 'Unlinked location', status: 'unlinked' };
+}
+
+// A sub-location's name/link/status. Players get objects; the editor stores Notion IDs.
+function subInfo(sub) {
+  if (!EDIT) return { ...sub, status: 'public' };
+  return locationInfo(sub) || { id: sub, name: 'Missing Notion page', status: 'missing' };
+}
+
+const pinKind = pin => placeType(pin.type).label;
+
+// Editor only: links to a location's paired DM Database page(s). The relation gives
+// page IDs, and notion.so/<id> opens any page you have access to by its ID.
+const dmPageUrl = id => `https://www.notion.so/${id}`;
+function dmLinks(loc, { short = false } = {}) {
+  const ids = loc?.dmPages || [];
+  return ids.map((id, i) => {
+    const a = document.createElement('a');
+    a.className = 'loc-open dm-link';
+    a.href = dmPageUrl(id);
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    const label = short ? 'DM' : 'DM page';
+    a.textContent = `${label}${ids.length > 1 ? ` ${i + 1}` : ''} ↗`;
+    a.addEventListener('click', e => e.stopPropagation());
+    return a;
+  });
 }
 
 function pinIcon(pin) {
@@ -709,21 +769,11 @@ function pinIcon(pin) {
   const box = t.dotSize + 6;
   return L.divIcon({
     className: `place-pin${tag ? ' is-flagged' : ''}`,
-    html: `<span class="dot" style="width:${t.dotSize}px;height:${t.dotSize}px;background:${t.color}"></span>` +
-          `<span class="name"${tag} style="left:${box + 4}px;font-size:${t.fontSize}px">${escapeHtml(info.name)}</span>`,
+    html: `<span class="dot" style="width:${+t.dotSize}px;height:${+t.dotSize}px;background:${HEX_COLOR.test(t.color) ? t.color : '#b8893a'}"></span>` +
+          `<span class="name"${tag} style="left:${box + 4}px;font-size:${+t.fontSize}px">${escapeHtml(info.name)}</span>`,
     iconSize: [box, box],
     iconAnchor: [box / 2, box / 2],
     popupAnchor: [0, -box / 2],
-  });
-}
-
-function labelIcon(label) {
-  const info = placeInfo(label);
-  const tag = info.status === 'public' ? '' : ` data-tag="${info.status}"`;
-  return L.divIcon({
-    className: `island-label${tag ? ' is-flagged' : ''}${!EDIT && safeUrl(info.url) ? ' has-link' : ''}`,
-    html: `<span${tag}>${escapeHtml(info.name)}</span>`,
-    iconSize: null,
   });
 }
 
@@ -760,7 +810,7 @@ function renderParty() {
 }
 
 // What players see when they click a place, e.g. "City・(New Shey-gaas)"
-function viewPopup(place, kindLabel) {
+function placeDetails(place, kindLabel) {
   const info = placeInfo(place);
   const el = document.createElement('div');
 
@@ -798,6 +848,81 @@ function viewPopup(place, kindLabel) {
   return el;
 }
 
+/* ---- Places-within panel ----
+   A pin's popup works as always. If the pin has places within it, they're
+   listed in a panel docked above the drift controls (same width), so the
+   list doesn't cover the map. No places within, no panel. */
+let selectedPinId = null;
+
+const SubPanel = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd() {
+    const el = L.DomUtil.create('section', 'sub-panel');
+    el.hidden = true;
+    L.DomEvent.disableClickPropagation(el);
+    L.DomEvent.disableScrollPropagation(el);
+    this.el = el;
+    return el;
+  },
+});
+let subPanel = null;   // created after the drift controls so it stacks above them
+
+function markSelected(pinId) {
+  pinMarkers.forEach((marker, id) => marker.getElement()?.classList.toggle('is-selected', id === pinId));
+}
+
+function showSubLocations(pin, highlightSubId = null) {
+  const subs = (pin.subLocations || []).map(subInfo);
+  if (!subPanel || !subs.length) return hideSubLocations();
+  const el = subPanel.el;
+  const make = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  };
+
+  const close = make('button', 'sub-close', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Close places within');
+  close.addEventListener('click', hideSubLocations);
+
+  const heading = make('h2', 'sub-heading');
+  heading.append(make('span', 'sub-heading-label', 'Places within'), make('span', 'sub-heading-parent', placeInfo(pin).name));
+  el.setAttribute('aria-label', `Places within ${placeInfo(pin).name}`);
+
+  const list = make('ul', 'sub-list');
+  let highlighted = null;
+  subs.forEach(sub => {
+    const li = make('li');
+    const href = safeUrl(sub.url);
+    const row = make(href ? 'a' : 'span', 'sub-row');
+    if (href) {
+      row.href = href;
+      row.target = '_blank';
+      row.rel = 'noopener noreferrer';
+    }
+    row.append(make('span', 'sub-name', sub.name));
+    if (sub.pronunciation) row.append(make('span', 'sub-pron', sub.pronunciation));
+    li.append(row);
+    if (sub.id === highlightSubId) { li.classList.add('is-highlight'); highlighted = li; }
+    list.append(li);
+  });
+
+  el.replaceChildren(close, heading, list);
+  el.hidden = false;
+  el.scrollTop = 0;
+  if (highlighted) setTimeout(() => highlighted.scrollIntoView({ block: 'nearest' }), 0);
+  selectedPinId = pin.id;
+  markSelected(selectedPinId);
+}
+
+function hideSubLocations() {
+  if (subPanel) subPanel.el.hidden = true;
+  selectedPinId = null;
+  markSelected(null);
+}
+
 function renderPlaces() {
   map.closePopup();
   renderParty();
@@ -808,63 +933,46 @@ function renderPlaces() {
   const editingPlaces = EDIT && editor.tool === 'places';
 
   data.pins.forEach(pin => {
-    // Players only receive public places; also skip any still under the fog
-    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
+    const drifts = !!pin.drifts;
+    // Players only receive public places; fixed ones under the fog are skipped here.
+    // Drifting ones move in and out of the fog, so they're checked when clicked.
+    if (!EDIT && !drifts && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
 
     const marker = L.marker([H - pin.y, pin.x], {
-      pane: 'pins',
+      pane: drifts ? 'labels' : 'pins',   // drifting places sit above the islands they ride on
       icon: pinIcon(pin),
       interactive: !EDIT || editingPlaces,
       draggable: editingPlaces,
     });
-    if (editingPlaces) {
-      marker.on('dragend', () => {
-        const ll = clampLatLng(marker.getLatLng());
-        change(() => {
-          pin.x = Math.round(ll.lng);
-          pin.y = Math.round(H - ll.lat);
-        }, { rebuildFog: false });
-      });
-      marker.on('click', () => openEditPopup(marker, pin, 'pins'));
-    } else if (!EDIT) {
-      marker.bindPopup(() => viewPopup(pin, placeType(pin.type).label));
-    }
-    marker.addTo(pinLayer);
-    pinMarkers.set(pin.id, marker);
-  });
+    const entry = { place: pin, marker, dragging: false };
 
-  data.islandLabels.forEach(label => {
-    const playerLink = !EDIT && safeUrl(label.url);
-    const marker = L.marker([H - label.y, label.x], {
-      pane: 'labels',
-      interactive: editingPlaces || !!playerLink,
-      draggable: editingPlaces,
-      keyboard: false,
-      icon: labelIcon(label),
-    });
-    if (playerLink) {
-      // Island names drift, so check the fog where the name is right now
-      marker.on('click', () => {
-        const ll = marker.getLatLng();
-        if (CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) return;
-        L.popup().setLatLng(ll).setContent(viewPopup(label, 'Island')).openOn(map);
-      });
-    }
-    const entry = { place: label, marker, dragging: false };
     if (editingPlaces) {
       marker.on('dragstart', () => { entry.dragging = true; });
       marker.on('dragend', () => {
         entry.dragging = false;
         const ll = clampLatLng(marker.getLatLng());
         change(() => {
-          label.x = Math.round(wrap01(ll.lng / W + state.islands) * W);   // screen spot -> islands image spot
-          label.y = Math.round(H - ll.lat);
+          // A drifting place stores its spot on the islands image, not the screen
+          pin.x = Math.round(drifts ? wrap01(ll.lng / W + state.islands) * W : ll.lng);
+          pin.y = Math.round(H - ll.lat);
         }, { rebuildFog: false });
       });
-      marker.on('click', () => openEditPopup(marker, label, 'islandLabels'));
+      marker.on('click', () => openEditPopup(marker, pin));
+    } else if (!EDIT) {
+      marker.bindPopup(() => placeDetails(pin, pinKind(pin)));
+      marker.on('popupopen', () => {
+        // A drifting place may have floated into the fog since it was drawn
+        const ll = marker.getLatLng();
+        if (drifts && CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) { marker.closePopup(); return; }
+        showSubLocations(pin);
+      });
+      marker.on('popupclose', () => { if (selectedPinId === pin.id) hideSubLocations(); });
     }
-    islandLabelEntries.push(entry);
-    marker.addTo(islandLabelLayer);
+
+    marker.addTo(drifts ? islandLabelLayer : pinLayer);
+    pinMarkers.set(pin.id, marker);
+    if (drifts) islandLabelEntries.push(entry);
+    if (pin.id === selectedPinId) marker.getElement()?.classList.add('is-selected');
   });
 }
 
@@ -907,6 +1015,12 @@ const DriftControl = L.Control.extend({
   },
 });
 new DriftControl().addTo(map);
+if (!EDIT) {
+  subPanel = new SubPanel().addTo(map);   // closes along with its pin's popup
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) map.closePopup();
+  });
+}
 
 /* ==========================================================================
    Edit mode (open the page with ?edit on the URL)
@@ -920,7 +1034,7 @@ const editor = {
 };
 let editPanel = null;
 let lastType = 'pin';
-let lastKind = placeTypeKey(DEFAULT_PLACE_TYPE);
+let lastKind = null;   // the kind picked most recently, reused for the next new pin
 
 /* ---- Combobox ----
    Shared by the Notion location picker and the map search: a text input that
@@ -968,8 +1082,11 @@ function createCombobox({ input, list, getOptions, onChoose, onClose = () => {} 
         detail.textContent = opt.detail;
         li.append(detail);
       }
-      // pointerdown + preventDefault keeps focus in the input, so the list doesn't close first
-      li.addEventListener('pointerdown', e => { e.preventDefault(); choose(i); });
+      // pointerdown + preventDefault keeps focus in the input so the list stays open;
+      // choosing on click (not pointerdown) means the click lands on this row, not on the
+      // map behind it, so Leaflet doesn't mistake it for a map click and close the popup
+      li.addEventListener('pointerdown', e => e.preventDefault());
+      li.addEventListener('click', e => { e.stopPropagation(); choose(i); });
       list.append(li);
     });
     notes.forEach(text => {
@@ -1068,8 +1185,8 @@ function locationPicker(currentPlace, onChange) {
 
   let selected = currentPlace?.notionId || null;
 
-  const onMapElsewhere = id =>
-    [...data.pins, ...data.islandLabels].some(p => p !== currentPlace && p.notionId === id);
+  const onMapElsewhere = id => [...data.pins, ...data.islandLabels].some(p =>
+    (p !== currentPlace && p.notionId === id) || (p.subLocations || []).includes(id));
   const labelFor = id => (id ? locations.get(id)?.name || 'Missing Notion page' : '');
 
   function renderTags() {
@@ -1083,7 +1200,9 @@ function locationPicker(currentPlace, onChange) {
     if (!selected) return add('Not linked', 'tag-muted');
     const loc = locations.get(selected);
     if (!loc) return add('Missing in Notion', 'tag-warn');
-    add(loc.public ? 'Public' : 'Private', loc.public ? 'tag-public' : 'tag-private');
+    if (loc.public) add('Public', 'tag-public');
+    else if (loc.visibility === 'private') add('Private', 'tag-private');
+    else add('Visibility unknown', 'tag-warn');
     if (onMapElsewhere(selected)) add('Also on map', 'tag-muted');
     const href = safeUrl(loc.url);
     if (href) {
@@ -1092,9 +1211,10 @@ function locationPicker(currentPlace, onChange) {
       a.href = href;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
-      a.textContent = 'Open in Notion ↗';
+      a.textContent = 'Campaign page ↗';
       tags.append(a);
     }
+    tags.append(...dmLinks(loc));
   }
 
   const combo = createCombobox({
@@ -1136,9 +1256,103 @@ function locationPicker(currentPlace, onChange) {
   return { root, input, get value() { return selected; } };
 }
 
-function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
-  const kindOptions = Object.entries(PLACE_TYPES)
-    .map(([key, t]) => `<option value="${escapeHtml(key)}">${escapeHtml(t.label)}</option>`).join('');
+// "Places within" field for pins: removable chips plus a search to add more
+function statusTag(status) {
+  return {
+    public: ['Public', 'tag-public'],
+    private: ['Private', 'tag-private'],
+    'visibility unknown': ['Visibility unknown', 'tag-warn'],
+    missing: ['Missing in Notion', 'tag-warn'],
+  }[status] || ['', 'tag-muted'];
+}
+
+function subLocationField(place, getParentId) {
+  const uid = `subs-${++comboCount}`;
+  let subs = [...(place.subLocations || [])];
+  const root = document.createElement('div');
+  root.className = 'sub-field';
+  root.innerHTML = `
+    <label for="${uid}-input">Places within</label>
+    <ul class="sub-chips"></ul>
+    <div class="combo">
+      <input id="${uid}-input" class="combo-input" type="text" role="combobox"
+        aria-autocomplete="list" aria-expanded="false" aria-controls="${uid}-list"
+        autocomplete="off" spellcheck="false" placeholder="Add a place within…">
+      <ul id="${uid}-list" class="combo-list" role="listbox" hidden></ul>
+    </div>`;
+  const chips = root.querySelector('.sub-chips');
+  const input = root.querySelector('.combo-input');
+
+  // Is this location used anywhere else on the map (as a place or inside another pin)?
+  const usedElsewhere = id => [...data.pins, ...data.islandLabels].some(p =>
+    p.notionId === id || (p !== place && (p.subLocations || []).includes(id)));
+
+  function renderChips() {
+    chips.replaceChildren();
+    subs.forEach(id => {
+      const info = subInfo(id);
+      const li = document.createElement('li');
+      li.className = 'sub-chip';
+      const name = document.createElement('span');
+      name.className = 'sub-chip-name';
+      name.textContent = info.name;
+      li.append(name);
+      const [tagText, tagClass] = statusTag(info.status);
+      if (tagText) {
+        const tag = document.createElement('span');
+        tag.className = `tag ${tagClass}`;
+        tag.textContent = tagText;
+        li.append(tag);
+      }
+      li.append(...dmLinks(locations.get(id), { short: true }));
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'chip-remove';
+      remove.textContent = '×';
+      remove.setAttribute('aria-label', `Remove ${info.name}`);
+      remove.addEventListener('click', e => {
+        e.stopPropagation();   // this button is removed below; don't let the click reach the map
+        subs = subs.filter(s => s !== id);
+        renderChips();
+      });
+      li.append(remove);
+      chips.append(li);
+    });
+  }
+
+  createCombobox({
+    input,
+    list: root.querySelector('.combo-list'),
+    getOptions(query) {
+      const q = nameKey(query);
+      const found = [...locations.values()].filter(loc =>
+        !subs.includes(loc.id) && loc.id !== getParentId() &&
+        (!q || nameKey(loc.name).includes(q) || nameKey(loc.aliases).includes(q)));
+      const options = found.slice(0, PICKER_LIMIT).map(loc => ({
+        id: loc.id,
+        label: loc.name,
+        detail: usedElsewhere(loc.id) ? 'on map' : '',
+        detailTag: true,
+      }));
+      const notes = [];
+      if (!found.length) notes.push(query ? 'No matching locations' : 'No more locations to add');
+      if (found.length > PICKER_LIMIT) notes.push(`${found.length - PICKER_LIMIT} more · keep typing to narrow it down`);
+      return { options, notes };
+    },
+    onChoose(opt) {
+      subs.push(opt.id);
+      renderChips();
+    },
+    onClose() { input.value = ''; },
+  });
+
+  renderChips();
+  return { root, get value() { return [...subs]; } };
+}
+
+function placeForm({ heading, place, onSave, onDelete }) {
+  const kindOptions = placeTypes()
+    .map(t => `<option value="${escapeHtml(t.key)}">${escapeHtml(t.label)}</option>`).join('');
 
   const form = document.createElement('form');
   form.className = 'place-form';
@@ -1146,13 +1360,13 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
     <h3></h3>
     <div data-picker></div>
     <label class="unlinked-only">Working name <input type="text" name="workingName" autocomplete="off" placeholder="Optional, editor only"></label>
-    ${allowType ? `
-      <fieldset>
-        <label><input type="radio" name="type" value="pin"> Fixed pin on the map</label>
-        <label><input type="radio" name="type" value="island"> Island name (drifts)</label>
-      </fieldset>` : ''}
-    <label class="pin-only">Kind <select name="kind">${kindOptions}</select></label>
-    <label class="pin-only">Map description <textarea name="note" rows="3"></textarea></label>
+    <fieldset>
+      <label><input type="radio" name="type" value="pin"> On the map (fixed)</label>
+      <label><input type="radio" name="type" value="island"> On a sky island (drifts)</label>
+    </fieldset>
+    <label>Kind <select name="kind">${kindOptions}</select></label>
+    <label>Map description <textarea name="note" rows="3"></textarea></label>
+    <div data-subs></div>
     <div class="row">
       <button type="submit" class="btn primary">Save</button>
       ${onDelete ? '<button type="button" class="btn danger" data-delete>Delete</button>' : ''}
@@ -1161,19 +1375,17 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
   form.querySelector('h3').textContent = heading;
   const picker = locationPicker(place.id ? place : null, () => sync());
   form.querySelector('[data-picker]').replaceWith(picker.root);
+  const subField = subLocationField(place, () => picker.value);
+  form.querySelector('[data-subs]').replaceWith(subField.root);
   form.elements.workingName.value = place.workingName || '';
   form.elements.note.value = place.note || '';
-  form.elements.kind.value = place.type ? placeTypeKey(place.type) : lastKind;
+  form.elements.kind.value = placeTypeKey(place.type || lastKind);
 
-  const currentType = () => (allowType ? form.elements.type.value : (isPin ? 'pin' : 'island'));
+  const currentType = () => form.elements.type.value;
   const sync = () => {
-    form.querySelectorAll('.pin-only').forEach(el => { el.hidden = currentType() !== 'pin'; });
     form.querySelector('.unlinked-only').hidden = !!picker.value;
   };
-  if (allowType) {
-    form.elements.type.value = lastType;
-    form.querySelectorAll('input[name=type]').forEach(r => r.addEventListener('change', sync));
-  }
+  form.elements.type.value = place.id ? (place.drifts ? 'island' : 'pin') : lastType;
   sync();
 
   form.addEventListener('submit', e => {
@@ -1184,9 +1396,13 @@ function placeForm({ heading, place, isPin, allowType, onSave, onDelete }) {
       note: form.elements.note.value.trim(),
       kind: form.elements.kind.value,
       type: currentType(),
+      subLocations: subField.value,
     });
   });
   form.querySelector('[data-delete]')?.addEventListener('click', onDelete);
+  // Clicks inside the form never count as map clicks (which would close this popup),
+  // even when the element clicked is removed from the page by its own handler
+  form.addEventListener('click', e => e.stopPropagation());
   L.DomEvent.disableClickPropagation(form);
   L.DomEvent.disableScrollPropagation(form);
   return form;
@@ -1205,42 +1421,39 @@ function openAddPopup(latlng) {
   openPopup(latlng, placeForm({
     heading: 'New place',
     place: {},
-    allowType: true,
-    onSave: ({ notionId, workingName, note, kind, type }) => {
+    onSave: ({ notionId, workingName, note, kind, type, subLocations }) => {
       lastType = type;
+      lastKind = kind;
+      const drifts = type === 'island';
       change(() => {
-        if (type === 'island') {
-          data.islandLabels.push({ id: newId(), notionId, x: Math.round(islandX), y, workingName });
-        } else {
-          lastKind = kind;
-          data.pins.push({ id: newId(), notionId, type: kind, x: Math.round(latlng.lng), y, note, workingName });
-        }
+        data.pins.push({
+          id: newId(), notionId, type: kind, note, workingName, subLocations, drifts,
+          x: Math.round(drifts ? islandX : latlng.lng), y,
+        });
       }, { rebuildFog: false });
     },
   }));
 }
 
-function openEditPopup(marker, place, listKey) {
-  const isPin = listKey === 'pins';
+function openEditPopup(marker, place) {
   openPopup(marker.getLatLng(), placeForm({
-    heading: isPin ? 'Edit pin' : 'Edit island name',
+    heading: 'Edit place',
     place,
-    isPin,
-    allowType: false,
-    onSave: ({ notionId, workingName, note, kind }) => {
+    onSave: ({ notionId, workingName, note, kind, type, subLocations }) => {
       change(() => {
-        place.notionId = notionId;
-        place.workingName = workingName;
-        if (isPin) {
-          place.note = note;
-          place.type = kind;
-          lastKind = kind;
+        Object.assign(place, { notionId, workingName, note, type: kind, subLocations });
+        lastKind = kind;
+        // Moving a place between the map and a sky island keeps it where it is on screen right now
+        const drifts = type === 'island';
+        if (drifts !== !!place.drifts) {
+          place.x = Math.round(drifts ? wrap01(place.x / W + state.islands) * W : wrap01(place.x / W - state.islands) * W);
+          place.drifts = drifts;
         }
       }, { rebuildFog: false });
     },
     onDelete: () => {
       if (!confirm(`Delete "${placeInfo(place).name}" from the map? (The Notion page isn't touched.)`)) return;
-      change(() => { data[listKey] = data[listKey].filter(p => p.id !== place.id); }, { rebuildFog: false });
+      change(() => { data.pins = data.pins.filter(p => p.id !== place.id); }, { rebuildFog: false });
     },
   }));
 }
@@ -1391,7 +1604,12 @@ if (EDIT) {
     onAdd() {
       const panel = L.DomUtil.create('div', 'edit-panel');
       panel.innerHTML = `
-        <h2>Editor</h2>
+        <div class="edit-head">
+          <h2>Editor</h2>
+          <button type="button" class="gear-btn" data-settings aria-label="Settings" title="Settings">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3.3h-4l-.3 2.6a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5zM13 15.5A3.5 3.5 0 1 1 13 8.5a3.5 3.5 0 0 1 0 7z" transform="translate(-1 0)"/></svg>
+          </button>
+        </div>
         <div class="seg" role="group" aria-label="Tool">
           <button type="button" class="btn" data-tool="places">Places</button>
           <button type="button" class="btn" data-tool="party">Party</button>
@@ -1439,6 +1657,7 @@ if (EDIT) {
       L.DomEvent.on(panel, 'pointerdown', L.DomEvent.stopPropagation);
 
       const $ = sel => panel.querySelector(sel);
+      $('[data-settings]').addEventListener('click', openSettings);
 
       panel.querySelectorAll('[data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
       panel.querySelectorAll('[data-shape]').forEach(b => b.addEventListener('click', () => {
@@ -1519,10 +1738,11 @@ if (EDIT) {
           count('unlinked') && `${count('unlinked')} unlinked`,
           count('private') && `${count('private')} private`,
           count('missing') && `${count('missing')} missing in Notion`,
+          count('visibility unknown') && `${count('visibility unknown')} with unknown visibility`,
         ].filter(Boolean);
-        const p = data.pins.length, l = data.islandLabels.length;
+        const p = data.pins.length, l = data.pins.filter(x => x.drifts).length;
         $('[data-count]').textContent =
-          `${p} ${p === 1 ? 'pin' : 'pins'}, ${l} island ${l === 1 ? 'name' : 'names'}` +
+          `${p} ${p === 1 ? 'place' : 'places'}${l ? ` (${l} on sky islands)` : ''}` +
           (flags.length ? ` (${flags.join(', ')})` : '') + `. ${locations.size} Notion locations.`;
 
         $('[data-status]').textContent = STATUS_TEXT[saver.status] || saver.message;
@@ -1552,14 +1772,17 @@ function updatePartyButton() {
 function searchablePlaces() {
   const found = [];
   data.pins.forEach(pin => {
-    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
+    // Fixed places are checked where they are; drifting ones where they've floated to right now
+    const spot = pin.drifts ? pinMarkers.get(pin.id)?.getLatLng() : L.latLng(H - pin.y, pin.x);
+    if (!EDIT && CONFIG.fog.enabled && (!spot || !Fog.isRevealed(spot.lng, H - spot.lat))) return;
     const info = placeInfo(pin);
-    found.push({ place: pin, kind: 'pin', info, kindLabel: placeType(pin.type).label });
-  });
-  islandLabelEntries.forEach(({ place, marker }) => {
-    const ll = marker.getLatLng();   // islands drift, so check where they are now
-    if (!EDIT && CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) return;
-    found.push({ place, kind: 'island', info: placeInfo(place), kindLabel: 'Island' });
+    const kindLabel = pin.drifts ? `${pinKind(pin)} · sky island` : pinKind(pin);
+    found.push({ place: pin, kind: 'pin', info, kindLabel });
+    // Places within this pin: found through their parent
+    (pin.subLocations || []).forEach(sub => {
+      const subDetails = subInfo(sub);
+      found.push({ place: pin, kind: 'sub', subId: subDetails.id, info: subDetails, kindLabel: `In ${info.name}` });
+    });
   });
   return found.sort((a, b) => a.info.name.localeCompare(b.info.name));
 }
@@ -1584,18 +1807,15 @@ function highlight(marker) {
   setTimeout(() => el.classList.remove('is-found'), 2400);
 }
 
-function goToPlace({ place, kind }) {
-  const marker = kind === 'pin'
-    ? pinMarkers.get(place.id)
-    : islandLabelEntries.find(e => e.place === place)?.marker;
+function goToPlace({ place, kind, subId }) {
+  const marker = pinMarkers.get(place.id);
   if (!marker) return;
   flyToSpot(marker.getLatLng(), () => {
     highlight(marker);
     if (EDIT) return;
-    if (kind === 'pin' && map.hasLayer(pinLayer)) {
-      marker.openPopup();
-    } else if (kind === 'island' && map.hasLayer(islandLabelLayer) && safeUrl(place.url)) {
-      L.popup().setLatLng(marker.getLatLng()).setContent(viewPopup(place, 'Island')).openOn(map);
+    if (map.hasLayer(place.drifts ? islandLabelLayer : pinLayer)) {
+      marker.openPopup();   // also opens the places-within panel
+      if (kind === 'sub') showSubLocations(place, subId);
     }
   });
 }
@@ -1661,6 +1881,199 @@ function goToParty() {
     e.preventDefault();
     input.focus();
   });
+})();
+
+/* ==========================================================================
+   Settings (editor gear icon). A modal with its own draft: nothing changes
+   until Save, and Save is a normal undoable edit that autosaves to the worker.
+   Sections are plain functions so more can be added later.
+   ========================================================================== */
+const slugify = s => nameKey(s).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'type';
+
+function openSettings() {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'settings-modal';
+  dialog.setAttribute('aria-labelledby', 'settings-title');
+  dialog.innerHTML = `
+    <form method="dialog" class="settings-form">
+      <header class="settings-head">
+        <h2 id="settings-title">Settings</h2>
+        <button type="button" class="settings-x" data-cancel aria-label="Close without saving">×</button>
+      </header>
+      <div class="settings-body"></div>
+      <footer class="settings-foot">
+        <p class="settings-note" role="status"></p>
+        <button type="button" class="btn" data-cancel>Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </footer>
+    </form>`;
+  document.body.append(dialog);
+
+  const body = dialog.querySelector('.settings-body');
+  const note = dialog.querySelector('.settings-note');
+  const sections = [placeTypesSection()];
+  sections.forEach(s => body.append(s.el));
+
+  const close = () => { dialog.close(); dialog.remove(); };
+  dialog.querySelectorAll('[data-cancel]').forEach(b => b.addEventListener('click', close));
+  dialog.addEventListener('cancel', e => { e.preventDefault(); close(); });   // Escape
+
+  dialog.querySelector('form').addEventListener('submit', e => {
+    e.preventDefault();
+    const problems = sections.flatMap(s => s.validate());
+    if (problems.length) { note.textContent = problems[0]; return; }
+    change(() => sections.forEach(s => s.apply()), { rebuildFog: false });
+    close();
+  });
+
+  dialog.showModal();
+}
+
+// Place types: label, color, sizes, order, default, add/remove
+function placeTypesSection() {
+  let draft = placeTypes().map(t => ({ ...t }));
+  let defaultRow = draft.find(t => t.key === defaultPlaceType().key) || draft[0];   // tracked by row, since new rows have no key yet
+  const inUse = key => data.pins.filter(p => placeTypeKey(p.type) === key).length;
+
+  const el = document.createElement('section');
+  el.className = 'settings-section';
+  el.innerHTML = `
+    <h3>Place types</h3>
+    <p class="settings-help">The kinds of pins on the map. Changes show for players too.</p>
+    <div class="type-head" aria-hidden="true"><span></span><span>Name</span><span>Color</span><span>Dot</span><span>Text</span><span>Default</span><span></span></div>
+    <ol class="type-list"></ol>
+    <button type="button" class="btn" data-add>+ Add place type</button>`;
+  const list = el.querySelector('.type-list');
+
+  function render() {
+    list.replaceChildren();
+    draft.forEach((t, i) => {
+      const li = document.createElement('li');
+      li.className = 'type-row';
+      li.innerHTML = `
+        <span class="type-preview" aria-hidden="true"><span class="dot"></span></span>
+        <input type="text" class="type-label" aria-label="Name" maxlength="40">
+        <input type="color" class="type-color" aria-label="Color">
+        <input type="number" class="type-dot" aria-label="Dot size" title="Dot size" min="4" max="30">
+        <input type="number" class="type-font" aria-label="Text size" title="Text size" min="10" max="36">
+        <input type="radio" name="default-type" class="type-default" aria-label="Default for new pins">
+        <span class="type-actions">
+          <button type="button" class="icon-btn" data-up aria-label="Move up">↑</button>
+          <button type="button" class="icon-btn" data-down aria-label="Move down">↓</button>
+          <button type="button" class="icon-btn danger" data-remove aria-label="Remove">×</button>
+        </span>`;
+      const $ = s => li.querySelector(s);
+      const dot = $('.type-preview .dot');
+      const paint = () => {
+        dot.style.background = HEX_COLOR.test(t.color) ? t.color : '#b8893a';
+        dot.style.width = dot.style.height = `${clamp(+t.dotSize || 8, 4, 30)}px`;
+      };
+      $('.type-label').value = t.label;
+      $('.type-color').value = HEX_COLOR.test(t.color) ? t.color : '#b8893a';
+      $('.type-dot').value = t.dotSize;
+      $('.type-font').value = t.fontSize;
+      $('.type-default').checked = t === defaultRow;
+      $('[data-up]').disabled = i === 0;
+      $('[data-down]').disabled = i === draft.length - 1;
+      $('[data-remove]').disabled = draft.length === 1;
+      paint();
+
+      $('.type-label').addEventListener('input', e => { t.label = e.target.value; });
+      $('.type-color').addEventListener('input', e => { t.color = e.target.value; paint(); });
+      $('.type-dot').addEventListener('input', e => { t.dotSize = +e.target.value; paint(); });
+      $('.type-font').addEventListener('input', e => { t.fontSize = +e.target.value; });
+      $('.type-default').addEventListener('change', () => { defaultRow = t; });
+      const move = dir => { draft.splice(i, 1); draft.splice(i + dir, 0, t); render(); };
+      $('[data-up]').addEventListener('click', () => move(-1));
+      $('[data-down]').addEventListener('click', () => move(1));
+      $('[data-remove]').addEventListener('click', () => {
+        const count = inUse(t.key);
+        const fallback = defaultRow !== t ? defaultRow : draft.find(x => x !== t);
+        if (count && !confirm(`${count} ${count === 1 ? 'pin uses' : 'pins use'} "${t.label}". ` +
+          `When you save, ${count === 1 ? 'it' : 'they'} will become "${fallback.label}".`)) return;
+        draft.splice(i, 1);
+        if (defaultRow === t) defaultRow = fallback;
+        render();
+      });
+      list.append(li);
+    });
+  }
+
+  el.querySelector('[data-add]').addEventListener('click', () => {
+    draft.push({ key: '', label: 'New type', color: '#b8893a', dotSize: 8, fontSize: 14 });
+    render();
+    list.lastElementChild.querySelector('.type-label').select();
+  });
+
+  render();
+  return {
+    el,
+    validate() {
+      const labels = draft.map(t => t.label.trim());
+      if (labels.some(l => !l)) return ['Every place type needs a name.'];
+      const dupe = labels.find((l, i) => labels.findIndex(x => x.toLowerCase() === l.toLowerCase()) !== i);
+      if (dupe) return [`There are two place types named "${dupe}".`];
+      return [];
+    },
+    apply() {
+      // New types get a permanent key from their first name; renaming later never breaks pins
+      const taken = new Set(draft.filter(t => t.key).map(t => t.key));
+      let fallback = null;
+      const types = draft.map(t => {
+        let key = t.key;
+        if (!key) {
+          const base = slugify(t.label);
+          key = base;
+          for (let n = 2; taken.has(key); n++) key = `${base}-${n}`;
+          taken.add(key);
+        }
+        if (t === defaultRow) fallback = key;
+        return {
+          key,
+          label: t.label.trim(),
+          color: HEX_COLOR.test(t.color) ? t.color.toLowerCase() : '#b8893a',
+          dotSize: clamp(Math.round(+t.dotSize) || 8, 4, 30),
+          fontSize: clamp(Math.round(+t.fontSize) || 14, 10, 36),
+        };
+      });
+      const keys = new Set(types.map(t => t.key));
+      fallback = fallback || types[0].key;
+      data.settings = { ...data.settings, placeTypes: types, defaultPlaceType: fallback };
+      data.pins.forEach(p => { if (!keys.has(p.type)) p.type = fallback; });   // removed types move to the default
+    },
+  };
+}
+
+/* ==========================================================================
+   View switcher: Player / Preview / Editor, inside the layers menu.
+   Only shown in a browser that has the edit key, so players never see it.
+   ========================================================================== */
+(() => {
+  if (!EDIT && !PREVIEW && !storageGet(EDIT_KEY_STORAGE)) return;
+  const current = EDIT ? 'edit' : PREVIEW ? 'preview' : 'player';
+  const listEl = layersControl.getContainer().querySelector('.leaflet-control-layers-list');
+  const section = document.createElement('fieldset');
+  section.className = 'view-switch';
+  section.innerHTML = `
+    <legend>View</legend>
+    <label><input type="radio" name="map-view" value="player"> Player</label>
+    <label><input type="radio" name="map-view" value="preview"> Preview (all places)</label>
+    <label><input type="radio" name="map-view" value="edit"> Editor</label>`;
+  section.querySelector(`input[value="${current}"]`).checked = true;
+  section.addEventListener('change', e => {
+    const params = new URLSearchParams(location.search);
+    params.delete('edit');
+    params.delete('preview');
+    if (e.target.value !== 'player') params.set(e.target.value, '');
+    const query = params.toString().replace(/=(&|$)/g, '$1');   // "?preview" rather than "?preview="
+    location.href = location.pathname + (query ? `?${query}` : '') + location.hash;
+  });
+  listEl.append(section);
+
+  if (PREVIEW) {
+    const badge = L.DomUtil.create('div', 'preview-badge', container);
+    badge.textContent = 'Preview · all places shown';
+  }
 })();
 
 /* ==========================================================================
