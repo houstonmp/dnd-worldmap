@@ -4,6 +4,8 @@
    GET  /map      Public. The map for players: only places linked to a Public
                   Notion location, with a fixed set of fields. Nothing else leaves.
    GET  /editor   Edit key required. The full map plus every Location page.
+   GET  /preview  Edit key required. Same shape as /map, but with every place
+                  included regardless of visibility (for testing the player view).
    PUT  /map      Edit key required. Saves the full map. Rejects stale saves (409).
    POST /sync     Edit key required. Re-reads the Campaign Database now.
    POST /webhook  Notion webhook. Verifies the signature, then re-syncs.
@@ -25,6 +27,7 @@ const PROPS = {
   visibility: 'Visibility',
   pronunciation: 'Pronunciation',
   aliases: 'Aliases',
+  dmPage: '👨‍💻 DM Database',   // relation from a Campaign page to its DM Database page(s)
 };
 const LOCATION_TAG = 'location';   // matched case-insensitively
 
@@ -41,6 +44,10 @@ export default {
       switch (route) {
         case 'GET /map':
           return json(await playerMap(env), 200, cors);
+
+        case 'GET /preview':
+          if (!(await isEditor(request, env))) return json({ error: 'Invalid edit key' }, 401, cors);
+          return json(await playerMap(env, { includeAll: true }), 200, { ...cors, 'Cache-Control': 'no-store' });
 
         case 'GET /editor':
           if (!(await isEditor(request, env))) return json({ error: 'Invalid edit key' }, 401, cors);
@@ -176,6 +183,8 @@ function text(prop) {
   return names(prop).join(', ');
 }
 
+const relationIds = prop => (prop?.type === 'relation' ? prop.relation.map(r => cleanId(r.id)) : []);
+
 // Turn a Campaign Database page into the slim record the map uses (or null if it's not a Location)
 function toLocation(page) {
   const props = page.properties || {};
@@ -192,6 +201,7 @@ function toLocation(page) {
     url: page.url,
     visibility,                           // 'public' | 'private' | 'unknown' (editor only)
     public: visibility === 'public',      // players only ever get these
+    dmPages: relationIds(props[PROPS.dmPage]),   // editor only: the paired DM Database page(s)
     pronunciation: text(props[PROPS.pronunciation]),
     aliases: text(props[PROPS.aliases]),
   };
@@ -231,17 +241,49 @@ async function cachedLocations(env) {
 
 /* ---------------- Map storage ---------------- */
 
-const emptyMap = () => ({ party: null, pins: [], islandLabels: [], fog: [] });
+const emptyMap = () => ({ party: null, pins: [], islandLabels: [], fog: [], settings: {} });
 
 async function loadMap(env) {
   return (await env.MAP_KV.get('map', 'json')) || { version: 0, updatedAt: null, data: emptyMap() };
+}
+
+// Place types from the editor's Settings. Only these fields, in these ranges, are kept.
+function cleanPlaceTypes(types) {
+  if (!Array.isArray(types)) return undefined;
+  const clampInt = (v, lo, hi, fallback) => Math.min(hi, Math.max(lo, Math.round(Number(v)) || fallback));
+  const seen = new Set();
+  const cleaned = types
+    .filter(t => t && typeof t.key === 'string' && t.key && !seen.has(t.key) && seen.add(t.key))
+    .slice(0, 50)
+    .map(t => ({
+      key: t.key.slice(0, 60),
+      label: String(t.label || t.key).slice(0, 60),
+      color: /^#[0-9a-f]{6}$/i.test(t.color) ? t.color : '#b8893a',
+      dotSize: clampInt(t.dotSize, 4, 30, 8),
+      fontSize: clampInt(t.fontSize, 10, 36, 14),
+    }));
+  return cleaned.length ? cleaned : undefined;
+}
+
+function cleanSettings(s) {
+  const out = {};
+  const placeTypes = cleanPlaceTypes(s?.placeTypes);
+  if (placeTypes) out.placeTypes = placeTypes;
+  if (typeof s?.defaultPlaceType === 'string') out.defaultPlaceType = s.defaultPlaceType.slice(0, 60);
+  return out;
 }
 
 function cleanMapData(d) {
   const list = v => (Array.isArray(v) ? v : []);
   const party = d?.party && Number.isFinite(d.party.x) && Number.isFinite(d.party.y)
     ? { x: d.party.x, y: d.party.y } : null;
-  return { party, pins: list(d?.pins), islandLabels: list(d?.islandLabels), fog: list(d?.fog) };
+  return {
+    party,
+    pins: list(d?.pins),
+    islandLabels: list(d?.islandLabels),
+    fog: list(d?.fog),
+    settings: cleanSettings(d?.settings),
+  };
 }
 
 async function saveMap(request, env, cors) {
@@ -275,32 +317,53 @@ async function editorPayload(env) {
   return { map, locations: locations.items, syncedAt: locations.syncedAt, syncError };
 }
 
-// Only places linked to a Public location, and only these fields, ever reach players
-async function playerMap(env) {
+// Players: only places linked to a Public location, and only these fields, ever reach them.
+// includeAll (the editor's preview) keeps every place: private, unknown and unlinked too.
+async function playerMap(env, { includeAll = false } = {}) {
   const [map, locations] = await Promise.all([loadMap(env), cachedLocations(env)]);
-  const visible = new Map(locations.items.filter(l => l.public).map(l => [l.id, l]));
+  const visible = new Map(locations.items.filter(l => includeAll || l.public).map(l => [l.id, l]));
 
   const join = place => {
     const loc = visible.get(cleanId(place.notionId));
-    if (!loc) return null;
+    if (!loc && !includeAll) return null;
     return {
       id: place.id,
       x: place.x,
       y: place.y,
-      name: loc.name,
-      url: loc.url,
-      pronunciation: loc.pronunciation,
-      aliases: loc.aliases,
+      name: loc ? loc.name : place.workingName || (place.notionId ? 'Missing Notion page' : 'Unlinked location'),
+      url: loc ? loc.url : null,
+      pronunciation: loc ? loc.pronunciation : '',
+      aliases: loc ? loc.aliases : '',
     };
   };
+
+  // Places within a pin: each one is checked against its own Notion visibility,
+  // so a public city can list its public sewers while private places stay hidden
+  const subLocations = ids => (Array.isArray(ids) ? ids : [])
+    .map(id => visible.get(cleanId(id)))
+    .filter(Boolean)
+    .map(loc => ({ id: loc.id, name: loc.name, url: loc.url, pronunciation: loc.pronunciation }));
+
+  // Older island names are drifting pins now; convert any the editor hasn't re-saved yet
+  const allPins = [...map.data.pins, ...map.data.islandLabels.map(l => ({ ...l, drifts: true }))];
 
   return {
     party: map.data.party,
     fog: map.data.fog,
-    pins: map.data.pins
-      .map(p => { const j = join(p); return j && { ...j, type: p.type, note: p.note || '' }; })
+    settings: cleanSettings(map.data.settings),   // place type looks only; nothing secret
+    pins: allPins
+      .map(p => {
+        const j = join(p);
+        return j && {
+          ...j,
+          type: p.type,
+          note: p.note || '',
+          drifts: !!p.drifts,
+          subLocations: subLocations(p.subLocations),
+        };
+      })
       .filter(Boolean),
-    islandLabels: map.data.islandLabels.map(join).filter(Boolean),
+    islandLabels: [],
   };
 }
 
