@@ -193,11 +193,13 @@ const CanvasLayer = L.ImageOverlay.extend({
 const W = CONFIG.width, H = CONFIG.height;
 // Three ways to open the map:
 //   (no param)  Player view: the real thing, public places only, no key needed
-//   ?preview    Preview: the player view with every place included (edit key required)
+//   ?dm         DM view: every place, DM page links, session links, initiative tracker
+//               (edit key required; ?preview still works as an older name for it)
 //   ?edit       Editor (edit key required)
 const PARAMS = new URLSearchParams(location.search);
 const EDIT = PARAMS.has('edit');
-const PREVIEW = !EDIT && PARAMS.has('preview');
+const DMVIEW = !EDIT && (PARAMS.has('dm') || PARAMS.has('preview'));
+const PLAYER_FOG = !EDIT && !DMVIEW;   // only real players have places hidden by the fog
 const EDIT_KEY_STORAGE = 'dnd-map:edit-key';
 const UNSAVED_KEY = 'dnd-map:unsaved';
 
@@ -437,6 +439,8 @@ if (CONFIG.fog.enabled) {
     pane: 'fog',
     opacity: EDIT ? CONFIG.fog.editorOpacity : CONFIG.fog.opacity,
   }).addTo(map);
+  // The DM view can switch the players' fog off; players never get this toggle
+  if (DMVIEW) layersControl.addOverlay(fogLayer, 'Fog of war');
 }
 
 /* ==========================================================================
@@ -565,43 +569,28 @@ async function editorApi(path, options = {}) {
   }
 }
 
-/* ---- Autosave ----
-   Edits are saved as whole-map snapshots, but only after things settle:
-   a save waits until 1.5s after the last edit (and never more than 10s after
-   the first), so a burst of brush strokes or drags becomes one request.
-   Forms only change data when you press Save, so typing never triggers saves.
-   Unsaved changes are also kept in this browser until the worker confirms them. */
+/* ---- Saving ----
+   Rule for the whole map: every edit is kept in this browser right away
+   (localStorage), and nothing is sent to the worker until you press Save
+   (or Ctrl/Cmd + S). The map is uploaded as one snapshot per Save. */
 const saver = (() => {
-  const DEBOUNCE_MS = 1500, MAX_WAIT_MS = 10000;
-  let timer = null, firstEditAt = 0, inFlight = false, retryMs = 2000;
+  let inFlight = false;
   let status = 'saved', message = '';
 
   const dirty = () => !same(data, saved);
   const set = (s, msg = '') => { status = s; message = msg; editPanel?.update(); };
   const backup = () => storageSet(UNSAVED_KEY, dirty() ? JSON.stringify({ baseVersion: serverVersion, data }) : null);
 
+  // Called after every edit: keep it locally, upload nothing
   function schedule() {
     backup();
-    if (status === 'conflict') return;
-    if (!dirty()) {
-      clearTimeout(timer);
-      timer = null;
-      firstEditAt = 0;
-      if (!inFlight) set('saved');
-      return;
-    }
-    const now = Date.now();
-    if (!firstEditAt) firstEditAt = now;
-    clearTimeout(timer);
-    timer = setTimeout(flush, Math.max(0, Math.min(DEBOUNCE_MS, firstEditAt + MAX_WAIT_MS - now)));
-    if (!inFlight) set('pending');
+    if (status === 'conflict' || inFlight) return;
+    set(dirty() ? 'pending' : 'saved');
   }
 
+  // Upload to the worker (the Save button)
   async function flush() {
-    clearTimeout(timer);
-    timer = null;
-    if (inFlight || status === 'conflict' || !dirty()) return;
-    firstEditAt = 0;
+    if (inFlight || !dirty()) return;
     inFlight = true;
     const snapshot = structuredClone(data);
     set('saving');
@@ -609,20 +598,16 @@ const saver = (() => {
       const res = await editorApi('/map', { method: 'PUT', body: { baseVersion: serverVersion, data: snapshot } });
       serverVersion = res.version;
       saved = snapshot;
-      retryMs = 2000;
       backup();
+      inFlight = false;
       set(dirty() ? 'pending' : 'saved');
     } catch (err) {
-      if (err.status === 409) {
-        set('conflict', 'The map was saved from another tab or device. Reload to get the latest; your version is kept as a backup in this browser.');
-      } else {
-        set('error', `Couldn't save (${err.message}). Retrying in ${Math.round(retryMs / 1000)}s.`);
-        timer = setTimeout(flush, retryMs);
-        retryMs = Math.min(retryMs * 2, 60000);
-      }
-    } finally {
       inFlight = false;
-      if (dirty() && status === 'pending') schedule();   // edits made while this save was in flight
+      if (err.status === 409) {
+        set('conflict', 'The map was saved from another tab or device. Reload to get the latest; your version is kept in this browser.');
+      } else {
+        set('error', `Couldn't save (${err.message}). Your changes are kept in this browser; press Save to try again.`);
+      }
     }
   }
 
@@ -631,6 +616,7 @@ const saver = (() => {
     flush,
     dirty,
     get status() { return status; },
+    get saving() { return inFlight; },
     get message() { return message; },
     fail(msg) { set('error', msg); },
   };
@@ -700,7 +686,10 @@ async function loadEditor() {
 async function loadData() {
   try {
     if (EDIT) await loadEditor();
-    else if (PREVIEW) data = normalize(await editorApi('/preview'));
+    else if (DMVIEW) {
+      const [mapData] = await Promise.all([editorApi('/preview'), dm.load()]);
+      data = normalize(mapData);
+    }
     else data = normalize(await api('/map'));
   } catch (err) {
     console.error(err);
@@ -728,8 +717,10 @@ function locationInfo(id) {
 }
 
 // Name, link and status of a place. Players' places arrive pre-joined; the editor joins with Notion here.
+const viewStatus = v => ({ public: 'public', private: 'private', missing: 'missing', unlinked: 'unlinked' }[v] || 'visibility unknown');
+
 function placeInfo(place) {
-  if (!EDIT) return { ...place, status: 'public' };
+  if (!EDIT) return { ...place, status: DMVIEW ? viewStatus(place.visibility) : 'public' };
   const loc = locationInfo(place.notionId);
   if (loc) return loc;
   if (place.notionId) return { name: place.workingName || 'Missing Notion page', status: 'missing' };
@@ -738,7 +729,7 @@ function placeInfo(place) {
 
 // A sub-location's name/link/status. Players get objects; the editor stores Notion IDs.
 function subInfo(sub) {
-  if (!EDIT) return { ...sub, status: 'public' };
+  if (!EDIT) return { ...sub, status: DMVIEW ? viewStatus(sub.visibility) : 'public' };
   return locationInfo(sub) || { id: sub, name: 'Missing Notion page', status: 'missing' };
 }
 
@@ -845,6 +836,19 @@ function placeDetails(place, kindLabel) {
     link.textContent = 'Open location page ↗';
     el.append(link);
   }
+  if (DMVIEW) {
+    const row = document.createElement('div');
+    row.className = 'popup-dm';
+    const [tagText, tagClass] = statusTag(info.status);
+    if (tagText) {
+      const tag = document.createElement('span');
+      tag.className = `tag ${tagClass}`;
+      tag.textContent = tagText;
+      row.append(tag);
+    }
+    row.append(...dmLinks(place));
+    if (row.children.length) el.append(row);
+  }
   return el;
 }
 
@@ -905,6 +909,11 @@ function showSubLocations(pin, highlightSubId = null) {
     row.append(make('span', 'sub-name', sub.name));
     if (sub.pronunciation) row.append(make('span', 'sub-pron', sub.pronunciation));
     li.append(row);
+    if (DMVIEW) {
+      const [tagText, tagClass] = statusTag(sub.status);
+      if (sub.status !== 'public' && tagText) li.append(make('span', `tag ${tagClass}`, tagText));
+      li.append(...dmLinks(sub, { short: true }));
+    }
     if (sub.id === highlightSubId) { li.classList.add('is-highlight'); highlighted = li; }
     list.append(li);
   });
@@ -936,7 +945,7 @@ function renderPlaces() {
     const drifts = !!pin.drifts;
     // Players only receive public places; fixed ones under the fog are skipped here.
     // Drifting ones move in and out of the fog, so they're checked when clicked.
-    if (!EDIT && !drifts && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
+    if (PLAYER_FOG && !drifts && CONFIG.fog.enabled && !Fog.isRevealed(pin.x, pin.y)) return;
 
     const marker = L.marker([H - pin.y, pin.x], {
       pane: drifts ? 'labels' : 'pins',   // drifting places sit above the islands they ride on
@@ -963,7 +972,7 @@ function renderPlaces() {
       marker.on('popupopen', () => {
         // A drifting place may have floated into the fog since it was drawn
         const ll = marker.getLatLng();
-        if (drifts && CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) { marker.closePopup(); return; }
+        if (PLAYER_FOG && drifts && CONFIG.fog.enabled && !Fog.isRevealed(ll.lng, H - ll.lat)) { marker.closePopup(); return; }
         showSubLocations(pin);
       });
       marker.on('popupclose', () => { if (selectedPinId === pin.id) hideSubLocations(); });
@@ -1015,6 +1024,2959 @@ const DriftControl = L.Control.extend({
   },
 });
 new DriftControl().addTo(map);
+
+/* ==========================================================================
+   DM tools (DM view only): session links and the initiative tracker.
+   Edits are kept in this browser (localStorage) as you make them, with no
+   network calls. The Save button uploads them to the worker (/dm) so they're
+   on your other devices; saving or deleting an encounter uploads too.
+   The worker keeps this separate from the map, and never sends it to players.
+   ========================================================================== */
+const emptyDm = () => ({ links: [], currentLinkId: null, party: { size: 4, level: 1 }, tracker: { round: 1, turn: 0, combatants: [] }, encounters: [], bestiary: [], presets: [], spells: [], spellAliases: {} });
+
+const DM_CACHE = 'dnd-map:dm-cache';
+
+// Fields we sent with a real value that the worker's stored copy doesn't have at all.
+// That means the worker is older than the site and would silently lose data.
+function droppedFields(sent, stored, path = '', out = new Set()) {
+  if (Array.isArray(sent) && Array.isArray(stored)) {
+    sent.forEach((v, i) => droppedFields(v, stored.find?.(s => s && v && s.id && s.id === v.id) ?? stored[i], path, out));
+  } else if (sent && typeof sent === 'object' && stored && typeof stored === 'object') {
+    for (const [k, v] of Object.entries(sent)) {
+      const has = v !== null && v !== undefined && v !== '' && v !== false;
+      if (has && !(k in stored)) out.add(path ? `${path}.${k}` : k);
+      else if (k in stored) droppedFields(v, stored[k], k === 'statblock' ? 'statblock' : (path ? `${path}.${k}` : k), out);
+    }
+  }
+  return out;
+}
+
+// Compare data by content, ignoring the order of fields (the worker may store fields in a different order)
+const stableJson = v => JSON.stringify(v, (key, val) =>
+  val && typeof val === 'object' && !Array.isArray(val)
+    ? Object.fromEntries(Object.keys(val).sort().map(k => [k, val[k]]))
+    : val);
+
+const dm = (() => {
+  let state = emptyDm();
+  let version = 0;           // version of the worker's copy this browser last saw
+  let savedJson = stableJson(state);
+  let saving = false, problem = '';
+  let creaturePages = [];   // Notion pages tagged Hostiles / NPC / PC (read only, never saved)
+  let tagsSeen = [];        // every tag in the database, to explain an empty list
+  const listeners = new Set();
+  const redraw = () => listeners.forEach(fn => fn());
+  const refreshStatus = () => listeners.forEach(fn => fn.statusOnly?.());   // never re-renders, so typing isn't interrupted
+  const cacheLocally = () => storageSet(DM_CACHE, JSON.stringify({ baseVersion: version, data: state }));
+
+  async function upload() {
+    const sent = stableJson(state);
+    const res = await editorApi('/dm', { method: 'PUT', body: { baseVersion: version, data: structuredClone(state) } });
+    version = res.version;
+    if (res.data) {
+      const stored = { ...emptyDm(), ...res.data };
+      savedJson = stableJson(stored);
+      // Safety net: if the worker didn't keep some fields, it's out of date. Keep this browser's copy
+      // (still marked unsaved, so nothing is lost) and say which fields it dropped.
+      const dropped = [...droppedFields(JSON.parse(sent), stored)];
+      if (dropped.length) {
+        cacheLocally();
+        throw Object.assign(new Error(`The worker didn't keep ${dropped.slice(0, 4).join(', ')}${dropped.length > 4 ? '…' : ''}. It's probably an older version; run npx wrangler deploy. Your changes are kept in this browser.`), { dropped });
+      }
+      // Adopt exactly what the worker stored as the saved copy, if nothing was edited during the save
+      if (stableJson(state) === sent) state = stored;
+    } else {
+      savedJson = stableJson(state);
+    }
+    cacheLocally();
+  }
+
+  return {
+    get data() { return state; },
+    get dirty() { return stableJson(state) !== savedJson; },
+    get saving() { return saving; },
+    get problem() { return problem; },
+    get creaturePages() { return creaturePages; },
+    get tagsSeen() { return tagsSeen; },
+    setCreaturePages(list, tags) { creaturePages = list || []; tagsSeen = tags || tagsSeen; redraw(); },
+
+    async load() {
+      const res = await editorApi('/dm');
+      creaturePages = res.creaturePages || [];
+      tagsSeen = res.tagsSeen || [];
+      const server = { ...emptyDm(), ...res.data };
+      migrateCreatures(server.bestiary);
+      version = res.version;
+      savedJson = stableJson(server);
+      migrateCreatures(server.bestiary);
+      state = server;
+      // Prefer this browser's copy if it has edits that were never saved
+      try {
+        const cached = JSON.parse(storageGet(DM_CACHE) || 'null');
+        if (cached && stableJson({ ...emptyDm(), ...cached.data }) !== savedJson) {
+          if (cached.baseVersion === res.version ||
+            confirm('This browser has DM changes that were never saved, but the saved copy has changed on another device.\n\nOK: keep this browser\'s version (press Save to upload it).\nCancel: use the saved copy.')) {
+            state = { ...emptyDm(), ...cached.data };
+            migrateCreatures(state.bestiary);
+          }
+        }
+      } catch { /* unreadable cache */ }
+      cacheLocally();
+      redraw();
+    },
+
+    // Edit locally. quiet: don't redraw (used while typing in fields, so focus isn't lost)
+    update(mutate, { quiet = false } = {}) {
+      mutate(state);
+      problem = '';
+      cacheLocally();
+      if (quiet) refreshStatus();
+      else redraw();
+    },
+
+    // Upload to the worker
+    async save() {
+      if (saving || !this.dirty) return;
+      saving = true;
+      problem = '';
+      refreshStatus();
+      try {
+        await upload();
+      } catch (err) {
+        if (err.status === 409 && confirm('The saved copy was changed on another device.\n\nOverwrite it with this browser\'s version?')) {
+          try {
+            version = (await editorApi('/dm')).version;
+            await upload();
+          } catch (retryErr) {
+            problem = `Couldn't save (${retryErr.message}).`;
+          }
+        } else {
+          problem = err.status === 409 ? 'Not saved: the saved copy changed elsewhere.'
+            : err.dropped ? err.message : `Couldn't save (${err.message}).`;
+        }
+      } finally {
+        saving = false;
+        refreshStatus();
+      }
+    },
+
+    subscribe(fn) { listeners.add(fn); },
+    refresh() { redraw(); },   // redraw panels after quiet edits (e.g. when the Bestiary closes)
+    unsubscribe(fn) { listeners.delete(fn); },
+  };
+})();
+
+const dmStatusText = () => dm.problem || (dm.saving ? 'Saving…' : dm.dirty ? 'Unsaved changes' : 'Saved');
+
+// A Save button + status line that update in place (no redraw) as things change
+function saveControls(className) {
+  const wrap = el('div', className);
+  const status = el('span', 'dm-status');
+  const button = el('button', 'btn dm-save', 'Save');
+  button.type = 'button';
+  button.title = 'Upload to the worker so it\'s on your other devices';
+  button.addEventListener('click', () => dm.save());
+  const refresh = () => {
+    status.textContent = dmStatusText();
+    status.classList.toggle('is-unsaved', dm.dirty && !dm.problem);
+    status.classList.toggle('is-problem', !!dm.problem);
+    button.disabled = dm.saving || !dm.dirty;
+  };
+  refresh();
+  wrap.append(status, button);
+  wrap.refresh = refresh;
+  return wrap;
+}
+const el = (tag, className, text) => {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+};
+// Remember which DM panels are minimized, per browser
+const panelOpen = (key, fallback = true) => (storageGet(`dnd-map:open:${key}`) ?? String(fallback)) === 'true';
+const setPanelOpen = (key, open) => storageSet(`dnd-map:open:${key}`, String(open));
+
+/* ---- Unsaved-changes banner (editor and DM view) ----
+   A loud pill at the bottom center whenever something hasn't been uploaded with Save. */
+function createUnsavedBanner({ dirty, saving, problem, conflict = () => false, save }) {
+  const bar = L.DomUtil.create('div', 'unsaved-banner', container);
+  bar.setAttribute('role', 'status');
+  bar.setAttribute('aria-live', 'polite');
+  const text = el('span', 'unsaved-text');
+  const button = el('button', 'unsaved-save', 'Save now');
+  button.type = 'button';
+  bar.append(el('span', 'unsaved-icon', '⚠'), text, button);
+  L.DomEvent.disableClickPropagation(bar);
+  L.DomEvent.disableScrollPropagation(bar);
+  button.addEventListener('click', () => (conflict() ? location.reload() : save()));
+
+  const refresh = () => {
+    const err = problem();
+    const busy = saving();
+    bar.hidden = !dirty() && !err && !busy;
+    bar.classList.toggle('is-saving', busy);
+    text.textContent = busy ? 'Saving to the worker…' : err || 'Unsaved changes, not on the worker yet';
+    button.textContent = conflict() ? 'Reload' : err ? 'Try again' : 'Save now';
+    button.disabled = busy;
+  };
+  refresh();
+  return { refresh };
+}
+
+/* ---- Party at a glance: AC, passive Perception and initiative (Dex) for everyone tagged Party ---- */
+const PartyPanel = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd() {
+    const root = L.DomUtil.create('section', 'dm-panel party-panel');
+    root.setAttribute('aria-label', 'Party at a glance');
+    L.DomEvent.disableClickPropagation(root);
+    L.DomEvent.disableScrollPropagation(root);
+    root.addEventListener('click', e => e.stopPropagation());
+
+    const render = () => {
+      const open = panelOpen('party');
+      const members = dm.data.bestiary.filter(c => c.inParty)
+        .sort((a, b) => creatureName(a).localeCompare(creatureName(b)));
+      root.replaceChildren();
+
+      const head = el('header', 'dm-head');
+      head.append(el('h2', 'dm-title', `Party${members.length ? ` (${members.length})` : ''}`));
+      const tools = el('div', 'dm-tools');
+      const bestiaryBtn = el('button', 'icon-btn', '📖');
+      bestiaryBtn.type = 'button';
+      bestiaryBtn.setAttribute('aria-label', 'Open the bestiary to change who is in the party');
+      bestiaryBtn.title = 'Change who is in the party (Bestiary)';
+      bestiaryBtn.addEventListener('click', () => openBestiary());
+      const toggle = el('button', 'icon-btn', open ? '–' : '+');
+      toggle.type = 'button';
+      toggle.setAttribute('aria-label', open ? 'Minimize the party' : 'Show the party');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.addEventListener('click', () => { setPanelOpen('party', !open); render(); });
+      const spellBtn = el('button', 'icon-btn', '✨');
+      spellBtn.type = 'button';
+      spellBtn.setAttribute('aria-label', 'Open your spellbook');
+      spellBtn.title = 'Spellbook';
+      spellBtn.addEventListener('click', () => openSpellbook());
+      tools.append(bestiaryBtn, spellBtn, toggle);
+      head.append(tools);
+      root.append(head);
+      if (!open) return;
+
+      if (!members.length) {
+        root.append(el('p', 'dm-empty', 'No one is tagged Party yet. Tick "Party member" on characters in the Bestiary (📖).'));
+        return;
+      }
+      const table = el('table', 'party-table');
+      const thead = el('thead');
+      const hr = el('tr');
+      [['', 'Name'], ['AC', 'Armor Class'], ['PP', 'Passive Perception'], ['Init', 'Initiative bonus (Dex modifier)']].forEach(([t, full]) => {
+        const th = el('th', '', t);
+        th.scope = 'col';
+        if (full && t) th.title = full;
+        if (!t) th.append(el('span', 'sr-only', full));
+        hr.append(th);
+      });
+      thead.append(hr);
+      const tbody = el('tbody');
+      const dash = v => (v === null || v === undefined || v === '' ? '–' : String(v));
+      members.forEach(c => {
+        const tr = el('tr');
+        const nameCell = el('th');
+        nameCell.scope = 'row';
+        const nameBtn = el('button', 'party-name', creatureName(c));
+        nameBtn.type = 'button';
+        nameBtn.title = `Open ${creatureName(c)} in the Bestiary`;
+        nameBtn.addEventListener('click', () => openBestiary(c.id));
+        nameCell.append(nameBtn);
+        const init = c.initBonus ?? (c.statblock?.abilities ? abilityMod(c.statblock.abilities.dex) : null);
+        tr.append(nameCell,
+          el('td', '', dash(c.ac)),
+          el('td', '', dash(c.passive)),
+          el('td', '', init === null || init === undefined ? '–' : signed(init)));
+        tbody.append(tr);
+      });
+      table.append(thead, tbody);
+      root.append(table);
+    };
+    dm.subscribe(render);
+    render();
+    return root;
+  },
+});
+
+/* ---- Session panel: quick links, with one marked as the current session ---- */
+const SessionPanel = L.Control.extend({
+  options: { position: 'bottomleft' },
+  onAdd() {
+    const root = L.DomUtil.create('section', 'dm-panel');
+    root.setAttribute('aria-label', 'Session links');
+    L.DomEvent.disableClickPropagation(root);
+    L.DomEvent.disableScrollPropagation(root);
+    root.addEventListener('click', e => e.stopPropagation());
+    let editing = false;
+
+    const render = () => {
+      const open = panelOpen('session');
+      const { links, currentLinkId } = dm.data;
+      root.replaceChildren();
+
+      const head = el('header', 'dm-head');
+      head.append(el('h2', 'dm-title', 'Session'));
+      const tools = el('div', 'dm-tools');
+      if (open) {
+        const editBtn = el('button', 'icon-btn', editing ? 'Done' : 'Edit');
+        editBtn.type = 'button';
+        editBtn.classList.add('text-btn');
+        editBtn.addEventListener('click', () => { editing = !editing; render(); });
+        tools.append(editBtn);
+      }
+      const toggle = el('button', 'icon-btn', open ? '–' : '+');
+      toggle.type = 'button';
+      toggle.setAttribute('aria-label', open ? 'Minimize session links' : 'Show session links');
+      toggle.setAttribute('aria-expanded', String(open));
+      toggle.addEventListener('click', () => { setPanelOpen('session', !open); editing = false; render(); });
+      tools.append(toggle);
+      head.append(tools);
+      root.append(head);
+      if (!open) { render.statusOnly = null; return; }
+
+      // Current session first, then the rest in your order
+      const ordered = [...links].sort((a, b) => (b.id === currentLinkId) - (a.id === currentLinkId));
+      const list = el('ul', 'dm-links');
+      if (!links.length && !editing) list.append(el('li', 'dm-empty', 'No links yet. Use Edit to add session notes, plans, or anything you reach for mid-game.'));
+
+      ordered.forEach(link => {
+        const li = el('li', `dm-link-row${link.id === currentLinkId ? ' is-current' : ''}`);
+        if (editing) {
+          const star = el('button', 'icon-btn', link.id === currentLinkId ? '★' : '☆');
+          star.type = 'button';
+          star.title = link.id === currentLinkId ? 'Current session' : 'Mark as current session';
+          star.setAttribute('aria-label', star.title);
+          star.addEventListener('click', () => dm.update(d => { d.currentLinkId = d.currentLinkId === link.id ? null : link.id; }));
+          li.append(star, el('span', 'dm-link-label', link.label));
+          const i = links.indexOf(link);
+          const move = dir => dm.update(d => { const [x] = d.links.splice(i, 1); d.links.splice(i + dir, 0, x); });
+          const up = el('button', 'icon-btn', '↑'); up.type = 'button'; up.disabled = i === 0; up.setAttribute('aria-label', 'Move up');
+          const down = el('button', 'icon-btn', '↓'); down.type = 'button'; down.disabled = i === links.length - 1; down.setAttribute('aria-label', 'Move down');
+          const del = el('button', 'icon-btn danger', '×'); del.type = 'button'; del.setAttribute('aria-label', `Remove ${link.label}`);
+          up.addEventListener('click', () => move(-1));
+          down.addEventListener('click', () => move(1));
+          del.addEventListener('click', () => dm.update(d => {
+            d.links = d.links.filter(l => l.id !== link.id);
+            if (d.currentLinkId === link.id) d.currentLinkId = null;
+          }));
+          li.append(up, down, del);
+        } else {
+          const a = el('a', 'session-link', link.label);
+          a.href = safeUrl(link.url) || '#';
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          if (link.id === currentLinkId) a.prepend(el('span', 'dm-current-tag', 'Current'));
+          li.append(a);
+        }
+        list.append(li);
+      });
+      root.append(list);
+
+      if (editing) {
+        const form = el('form', 'dm-add');
+        form.innerHTML = `
+          <input type="text" name="label" placeholder="Label (e.g. Session 5 plan)" maxlength="80" aria-label="Link label">
+          <input type="url" name="url" placeholder="https://www.notion.so/…" required aria-label="Link URL">
+          <button type="submit" class="btn">Add link</button>`;
+        form.addEventListener('submit', e => {
+          e.preventDefault();
+          const url = safeUrl(form.elements.url.value.trim());
+          if (!url) { form.elements.url.focus(); return; }
+          const label = form.elements.label.value.trim() || url;
+          dm.update(d => { d.links.push({ id: newId(), label, url }); });
+        });
+        root.append(form);
+      }
+      const saveRow = saveControls('dm-save-row');
+      root.append(saveRow);
+      render.statusOnly = saveRow.refresh;
+    };
+    dm.subscribe(render);
+    render();
+    return root;
+  },
+});
+
+/* ---- Initiative tracker ----
+   Rows: initiative, name, HP (current / max), AC; only the name matters.
+   HP accepts "-7" or "+5" to apply damage or healing.
+   Each combatant has notes, and a reserved `source` for future bestiary links. */
+/* ---- Bestiary (Open5e, through the worker) ----
+   Read only: lookups never write anything. Results are cached for this page. */
+const bestiaryClient = (() => {
+  const searches = new Map(), creatures = new Map();
+  const remember = (cache, key, load) => {
+    if (!cache.has(key)) cache.set(key, load().catch(err => { cache.delete(key); throw err; }));
+    return cache.get(key);
+  };
+  return {
+    // One page of results: { results, page, hasMore, fuzzy }
+    search: (q, page = 1) => remember(searches, `${q.toLowerCase()}|${page}`, () =>
+      editorApi(`/bestiary/search?q=${encodeURIComponent(q)}&page=${page}`)),
+    creature: slug => remember(creatures, slug, () =>
+      editorApi(`/bestiary/creature/${encodeURIComponent(slug)}`)),
+    spellSearch: (q, page = 1) => remember(searches, `spell:${q.toLowerCase()}|${page}`, () =>
+      editorApi(`/bestiary/spells?q=${encodeURIComponent(q)}&page=${page}`)),
+    spell: slug => remember(creatures, `spell:${slug}`, () =>
+      editorApi(`/bestiary/spell/${encodeURIComponent(slug)}`)),
+  };
+})();
+
+const abilityMod = score => Math.floor(((Number(score) || 10) - 10) / 2);
+const signed = n => (n >= 0 ? `+${n}` : `${n}`);
+const rollD20 = () => 1 + Math.floor(Math.random() * 20);
+const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Open5e text uses light markdown (_italic_, **bold**); show it as plain text
+const plainDesc = s => String(s || '').replace(/\*\*(.+?)\*\*/g, '$1').replace(/(^|\W)_(.+?)_(?=\W|$)/g, '$1$2');
+
+// Names for new combatants: "Goblin", or "Goblin 1", "Goblin 2"… once there's more than one
+function nextNames(combatants, base, count) {
+  const re = new RegExp(`^${escapeRegExp(base)}(?: (\\d+))?$`, 'i');
+  const same = combatants.filter(c => re.test(c.name || ''));
+  if (same.length + count === 1) return { names: [base], rename: null };
+  let max = 0, unnumbered = null;
+  same.forEach(c => { const m = c.name.match(re); if (m[1]) max = Math.max(max, Number(m[1])); else unnumbered = c; });
+  let rename = null;
+  if (unnumbered) {
+    const taken = same.some(c => c.name.toLowerCase() === `${base} 1`.toLowerCase());
+    const n = taken ? max + 1 : 1;
+    rename = { id: unnumbered.id, name: `${base} ${n}` };
+    max = Math.max(max, n);
+  }
+  return { names: Array.from({ length: count }, (_, i) => `${base} ${max + i + 1}`), rename };
+}
+
+// A 5e-style stat block from the worker's trimmed Open5e data
+function renderStatBlock(sb) {
+  const root = el('div', 'statblock');
+  root.append(el('h3', 'sb-name', sb.name));
+  const meta = [sb.size, sb.type ? sb.type.toLowerCase() + (sb.subtype ? ` (${sb.subtype})` : '') : ''].filter(Boolean).join(' ');
+  root.append(el('div', 'sb-meta', [meta, sb.alignment].filter(Boolean).join(', ') || (sb.homebrew ? 'Homebrew' : '')));
+
+  const line = (label, value) => {
+    if (!value) return null;
+    const p = el('p', 'sb-line');
+    p.append(el('strong', '', `${label} `), document.createTextNode(value));
+    return p;
+  };
+  const top = el('div', 'sb-section');
+  top.append(...[
+    line('Armor Class', sb.ac ? `${sb.ac}${sb.acDesc ? ` (${sb.acDesc})` : ''}` : ''),
+    line('Hit Points', sb.hp ? `${sb.hp}${sb.hitDice ? ` (${sb.hitDice})` : ''}` : ''),
+    line('Speed', sb.speed),
+    line('Initiative', sb.initBonus !== null && sb.initBonus !== undefined ? signed(sb.initBonus) : ''),
+  ].filter(Boolean));
+  if (top.children.length) root.append(top);
+
+  const abilities = el('div', 'sb-abilities');
+  if (sb.abilities) ['str', 'dex', 'con', 'int', 'wis', 'cha'].forEach(k => {
+    const cell = el('div', 'sb-ability');
+    const score = sb.abilities?.[k] ?? 10;
+    cell.append(el('span', 'sb-ab-name', k.toUpperCase()), el('span', 'sb-ab-score', `${score} (${signed(abilityMod(score))})`));
+    abilities.append(cell);
+  });
+  if (sb.abilities) root.append(abilities);
+
+  const props = el('div', 'sb-section');
+  props.append(...[
+    line('Saving Throws', sb.saves),
+    line('Skills', sb.skills),
+    line('Damage Vulnerabilities', sb.vulnerabilities),
+    line('Damage Resistances', sb.resistances),
+    line('Damage Immunities', sb.immunities),
+    line('Condition Immunities', sb.conditionImmunities),
+    line('Senses', sb.senses),
+    line('Languages', sb.languages),
+    line('Challenge', sb.cr ? `${sb.cr}${sb.xp ? ` (${sb.xp.toLocaleString()} XP)` : ''}` : ''),
+  ].filter(Boolean));
+  if (props.children.length) root.append(props);
+
+  const section = (title, items, intro) => {
+    if (!items?.length && !intro) return;
+    const s = el('div', 'sb-section');
+    if (title) s.append(el('h4', 'sb-heading', title));
+    if (intro) s.append(el('p', 'sb-desc', plainDesc(intro)));
+    items.forEach(it => {
+      const p = el('p', 'sb-desc');
+      p.append(el('strong', 'sb-item', `${plainDesc(it.name)}. `), document.createTextNode(plainDesc(it.desc)));
+      s.append(p);
+    });
+    root.append(s);
+  };
+  section('', sb.traits);
+  section('Actions', sb.actions);
+  section('Bonus Actions', sb.bonusActions);
+  section('Reactions', sb.reactions);
+  section('Legendary Actions', sb.legendaryActions, sb.legendaryDesc);
+  if (sb.source) root.append(el('p', 'sb-source', `Source: ${sb.source} (via Open5e)`));
+  return root;
+}
+
+// 2014 DMG experience by challenge rating ("1/4" or 0.25 both work)
+const XP_BY_CR = {
+  0: 10, 0.125: 25, 0.25: 50, 0.5: 100, 1: 200, 2: 450, 3: 700, 4: 1100, 5: 1800, 6: 2300, 7: 2900,
+  8: 3900, 9: 5000, 10: 5900, 11: 7200, 12: 8400, 13: 10000, 14: 11500, 15: 13000, 16: 15000,
+  17: 18000, 18: 20000, 19: 22000, 20: 25000, 21: 33000, 22: 41000, 23: 50000, 24: 62000,
+  25: 75000, 26: 90000, 27: 105000, 28: 120000, 29: 135000, 30: 155000,
+};
+const crValue = cr => {
+  const s = String(cr ?? '').trim();
+  if (!s) return null;
+  if (s.includes('/')) { const [a, b] = s.split('/').map(Number); return b ? a / b : null; }
+  return Number.isFinite(Number(s)) ? Number(s) : null;
+};
+const xpForCr = cr => XP_BY_CR[crValue(cr)] ?? null;
+
+const findCreature = id => dm.data.bestiary.find(c => c.id === id);
+
+const findPreset = id => dm.data.presets.find(p => p.id === id);
+const isPcPage = page => /\b(pcs?|player characters?)\b/i.test(page?.tag || '');
+// Characters get the Character section: linked to a PC page, or tagged Party
+const isCharacter = c => !!c && (c.inParty || isPcPage(findCreaturePage(c.notionId)));
+
+// Add every Party member who isn't already in initiative (players roll their own initiative)
+function addParty() {
+  const members = dm.data.bestiary.filter(c => c.inParty);
+  const present = new Set(dm.data.tracker.combatants.filter(c => c.source?.type === 'library').map(c => c.source.slug));
+  const missing = members.filter(c => !present.has(c.id));
+  if (!missing.length) return { added: 0, total: members.length };
+  dm.update(d => {
+    missing.forEach(c => d.tracker.combatants.push({
+      id: newId(), name: creatureName(c), init: null, hp: c.hp, maxHp: c.hp, ac: c.ac, notes: '',
+      source: { type: 'library', slug: c.id }, side: 'party', hidden: false, level: c.level ?? null, cr: c.cr || '',
+    }));
+  });
+  return { added: missing.length, total: members.length };
+}
+// Fill a creature from a preset: numbers + stat block. Name override, notes and Notion link stay.
+function applyPreset(c, preset) {
+  Object.assign(c, {
+    cr: preset.cr, ac: preset.ac, hp: preset.hp, hitDice: preset.hitDice, initBonus: preset.initBonus,
+    source: { type: 'preset', slug: preset.id },
+    statblock: structuredClone(preset.statblock || { name: preset.name }),
+    // Spellcasting comes along too
+    spellAbility: preset.spellAbility || '', spellDc: preset.spellDc ?? null, spellAttack: preset.spellAttack ?? null,
+    spells: structuredClone(preset.spells || []),
+  });
+  c.xp = xpForCr(c.cr);
+}
+
+// The name a creature goes by: your override, else its Notion page's name, else Open5e's
+const creatureName = c => (c.nameOverride || '').trim() || findCreaturePage(c.notionId)?.name ||
+  c.statblock?.name || c.name || 'Unnamed creature';
+const nameSourceLabel = c => ((c.nameOverride || '').trim() ? 'Your name'
+  : findCreaturePage(c.notionId)?.name ? 'Using the Notion page name'
+  : c.statblock?.name ? 'Using the Open5e name' : 'No name yet');
+
+// Older creatures stored one name; a name that matches Open5e's counts as inherited, anything else as yours
+function migrateCreatures(bestiary) {
+  (bestiary || []).forEach(c => {
+    if (c.nameOverride === undefined) c.nameOverride = c.statblock && c.name === c.statblock.name ? '' : (c.name || '');
+  });
+}
+const findCreaturePage = id => dm.creaturePages.find(p => p.id === id);
+
+// Add creatures from your bestiary to initiative (initiative rolled: d20 + their bonus)
+function addFromBestiary(creature, count = 1) {
+  dm.update(d => {
+    const { names, rename } = nextNames(d.tracker.combatants, creatureName(creature), count);
+    if (rename) { const t = d.tracker.combatants.find(x => x.id === rename.id); if (t) t.name = rename.name; }
+    names.forEach(n => d.tracker.combatants.push({
+      id: newId(), name: n,
+      init: rollD20() + (creature.initBonus ?? abilityMod(creature.statblock?.abilities?.dex)),
+      hp: creature.hp, maxHp: creature.hp, ac: creature.ac,
+      notes: '', source: { type: 'library', slug: creature.id },
+      // PCs (linked to a Notion page tagged PC) join the party; everything else starts hostile
+      side: creature.inParty ? 'party' : 'hostile',
+      hidden: false, level: null, cr: creature.cr || '',
+    }));
+  });
+}
+
+// Campaign page + DM page links for a creature linked to a Notion page (Hostiles, NPC or PC)
+function notionLinks(page) {
+  const out = [];
+  const href = page && safeUrl(page.url);
+  if (href) {
+    const a = el('a', 'loc-open', 'Player page ↗');
+    a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    out.push(a);
+  }
+  if (page) {
+    const dm = dmLinks(page);
+    out.push(...(dm.length ? dm : [el('span', 'tag tag-muted', 'No DM page linked in Notion')]));
+  }
+  return out;
+}
+
+// Read a stat block's Spellcasting / Innate Spellcasting trait:
+// ability, save DC, attack bonus, the intro sentence, and each spell with its level or note.
+const ABILITY_KEYS = { intelligence: 'int', wisdom: 'wis', charisma: 'cha' };
+function spellcastingTrait(sb) {
+  return (sb?.traits || []).find(t => /spellcasting/i.test(t.name || '') && /:/.test(t.desc || ''));
+}
+function parseSpellcasting(sb) {
+  const trait = spellcastingTrait(sb);
+  if (!trait) return null;
+  const desc = plainDesc(trait.desc);
+  const ability = (desc.match(/spellcasting ability is (\w+)/i) || [])[1];
+  const dc = (desc.match(/spell save DC (\d+)/i) || [])[1];
+  const attack = (desc.match(/([+-]\d+) to hit with spell attacks/i) || [])[1];
+  const spells = [], levelNotes = {};
+  desc.split(/\n+/).forEach(raw => {
+    const line = raw.replace(/^[\s*•\-]+/, '').trim();
+    let m, level = null, note = '', list = '';
+    if ((m = line.match(/^(cantrips?|(\d+)(?:st|nd|rd|th)[- ]level)\s*(?:\(([^)]*)\))?\s*:\s*(.+)$/i))) {
+      level = /^cantrip/i.test(m[1]) ? 0 : Number(m[2]);
+      if (m[3]) levelNotes[level] = m[3].trim();
+      list = m[4];
+    } else if ((m = line.match(/^(at will|\d+\s*\/\s*day(?:\s+each)?)\s*:\s*(.+)$/i))) {
+      note = m[1].toLowerCase().replace(/\s*each$/, '').replace(/\s+/g, '');
+      list = m[2];
+    } else return;
+    list.split(',').forEach(part => {
+      const extra = (part.match(/\(([^)]*)\)/) || [])[1];
+      const name = part.replace(/\([^)]*\)/g, '').replace(/[*†]+/g, '').trim();
+      if (name) spells.push({ name, level, note: [note === 'atwill' ? 'at will' : note, extra].filter(Boolean).join(', ') });
+    });
+  });
+  return {
+    intro: desc.split(/\n/)[0].trim(),
+    ability: ABILITY_KEYS[(ability || '').toLowerCase()] || '',
+    dc: dc ? Number(dc) : null,
+    attack: attack ? Number(attack) : null,
+    spells,
+    levelNotes,
+  };
+}
+// Find the Spellbook spell for a name: Open5e's exact spell for this monster first, then your own spells
+// and other names, then core rules over other publishers' spells of the same name
+function matchSpell(name, slugHints = new Set()) {
+  const n = nameKey(name);
+  const cat = spellCatalog();
+  const named = s => nameKey(s.name) === n || (s.aliases || []).some(a => nameKey(a) === n);
+  return cat.find(s => s.slug && slugHints.has(s.slug) && named(s))
+    || cat.find(s => s.mine && named(s))
+    || cat.find(s => named(s) && /core|srd|basic/i.test(s.source || ''))
+    || cat.find(named)
+    || null;
+}
+// "cone of cold" -> "Cone of Cold" (short words stay lowercase except at the start)
+const spellTitle = s => String(s).toLowerCase().split(' ')
+  .map((w, i) => (i && /^(of|and|the|to|from|in|on|with|a|an|or|for|at|by)$/.test(w) ? w : w.charAt(0).toUpperCase() + w.slice(1))).join(' ');
+const unlinkedKey = name => `u:${nameKey(name).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 110) || 'spell'}`;
+// Fill a creature's Spellcasting from its stat block, linking each spell to the Spellbook
+async function spellsFromStatblock(sb) {
+  const parsed = parseSpellcasting(sb);
+  if (!parsed) return null;
+  try { await spellIndex.load(); } catch { /* match against your own spells only */ }
+  const hints = new Set(sb.spellSlugs || []);
+  const seen = new Set(), spells = [];
+  parsed.spells.forEach(p => {
+    const hit = matchSpell(p.name, hints);
+    const key = hit ? hit.key : unlinkedKey(p.name);
+    if (seen.has(key)) return;
+    seen.add(key);
+    spells.push({ key, name: hit?.name || spellTitle(p.name), level: hit?.level ?? p.level ?? 0, prepared: true, note: p.note || '' });
+  });
+  return { spells, ability: parsed.ability, dc: parsed.dc, attack: parsed.attack };
+}
+async function importSpellsFromStatblock(creatureId) {
+  const found = await spellsFromStatblock(findCreature(creatureId)?.statblock);
+  if (!found) return null;
+  dm.update(d => {
+    const c = d.bestiary.find(x => x.id === creatureId);
+    if (!c) return;
+    c.spells = found.spells;
+    if (found.ability) c.spellAbility = found.ability;
+    if (found.dc != null) c.spellDc = found.dc;
+    if (found.attack != null) c.spellAttack = found.attack;
+  });
+  return { found: found.spells.length, unlinked: found.spells.filter(s => s.key.startsWith('u:')).length };
+}
+
+/* ---- Merging: carry chosen parts of one creature into another ----
+   Speeds merge by type (a fly speed is added, a slower walk is never kept over a faster one),
+   lists merge without duplicates, and named entries replace same-named ones. */
+const parseSpeed = s => String(s || '').split(',').map(x => x.trim()).filter(Boolean).map(seg => {
+  const m = seg.match(/^(?:([a-z]+)\s+)?(\d+)\s*ft\.?\s*(.*)$/i);
+  return m ? { type: (m[1] || 'walk').toLowerCase(), ft: Number(m[2]), extra: m[3].trim() } : { type: seg.toLowerCase(), ft: 0, extra: '', raw: seg };
+});
+const speedText = list => [...list].sort((a, b) => (a.type === 'walk' ? -1 : b.type === 'walk' ? 1 : 0))
+  .map(s => s.raw || `${s.type === 'walk' ? '' : `${s.type} `}${s.ft} ft.${s.extra ? ` ${s.extra}` : ''}`).join(', ');
+const splitList = s => String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+const listKey = x => nameKey(x).replace(/\s*[+-]?\d.*$/, '').trim();   // "darkvision 60 ft." -> "darkvision", "Stealth +4" -> "stealth"
+
+// Everything a source creature could contribute, as checklist items with what each would do
+function buildMergeItems(target, src) {
+  const tsb = target.statblock || {}, ssb = src.sb || {}, items = [];
+  const tSpeed = parseSpeed(tsb.speed);
+  parseSpeed(ssb.speed).forEach(sp => {
+    if (sp.raw) return;
+    const have = tSpeed.find(t => t.type === sp.type);
+    if (have && have.ft >= sp.ft) return;
+    items.push({ group: 'Movement & senses', label: `${titleCase(sp.type)} ${sp.ft} ft.${sp.extra ? ` ${sp.extra}` : ''}`,
+      detail: have ? `replaces your ${have.ft} ft.` : 'speed',
+      apply: c => { const list = parseSpeed(c.statblock.speed); const i = list.findIndex(t => t.type === sp.type); if (i >= 0) list[i] = sp; else list.push(sp); c.statblock.speed = speedText(list); } });
+  });
+  const listField = (field, group, what, skip) => {
+    const have = new Set(splitList(tsb[field]).map(listKey));
+    splitList(ssb[field]).forEach(x => {
+      if (skip?.(x)) return;
+      const already = have.has(listKey(x));
+      items.push({ group, label: x, detail: already ? 'already has this' : what, disabled: already,
+        apply: c => { const cur = splitList(c.statblock[field]); if (!cur.some(y => listKey(y) === listKey(x))) cur.push(x); c.statblock[field] = cur.join(', '); } });
+    });
+  };
+  listField('senses', 'Movement & senses', 'sense', x => /passive perception/i.test(x));
+  listField('skills', 'Skills & languages', 'skill');
+  listField('languages', 'Skills & languages', 'language');
+  [['vulnerabilities', 'Damage vulnerabilities'], ['resistances', 'Damage resistances'], ['immunities', 'Damage immunities']].forEach(([f, label]) => {
+    const v = String(ssb[f] || '').trim();
+    if (!v) return;
+    const already = nameKey(tsb[f] || '').includes(nameKey(v));
+    items.push({ group: 'Defenses', label: `${label}: ${v}`, detail: already ? 'already has this' : '', disabled: already,
+      apply: c => { c.statblock[f] = [c.statblock[f], v].filter(Boolean).join('; '); } });
+  });
+  listField('conditionImmunities', 'Defenses', 'condition immunity');
+  if (ssb.size || ssb.type) {
+    const text = [ssb.size, ssb.type && `${ssb.type.toLowerCase()}${ssb.subtype ? ` (${ssb.subtype})` : ''}`].filter(Boolean).join(' ');
+    items.push({ group: 'Size & type', label: text, detail: tsb.type || tsb.size ? `replaces ${[tsb.size, tsb.type].filter(Boolean).join(' ').toLowerCase()}` : 'size and type',
+      apply: c => { c.statblock.size = ssb.size || ''; c.statblock.type = ssb.type || ''; c.statblock.subtype = ssb.subtype || ''; } });
+  }
+  const castTrait = spellcastingTrait(ssb);
+  [['traits', 'Traits'], ['actions', 'Actions'], ['bonusActions', 'Bonus actions'], ['reactions', 'Reactions'], ['legendaryActions', 'Legendary actions']].forEach(([f, group]) => {
+    (ssb[f] || []).forEach(it => {
+      if (f === 'traits' && it === castTrait && src.spells?.length) return;   // offered as spells below
+      const same = (tsb[f] || []).find(x => nameKey(x.name) === nameKey(it.name));
+      if (same && same.desc === it.desc) { items.push({ group, label: it.name, detail: 'already has this', disabled: true }); return; }
+      items.push({ group, label: it.name, detail: `${same ? 'replaces yours · ' : ''}${plainDesc(it.desc).slice(0, 160)}${plainDesc(it.desc).length > 160 ? '…' : ''}`,
+        apply: c => {
+          const arr = c.statblock[f] = c.statblock[f] || [];
+          const i = arr.findIndex(x => nameKey(x.name) === nameKey(it.name));
+          if (i >= 0) arr[i] = structuredClone(it); else arr.push(structuredClone(it));
+          if (f === 'legendaryActions' && !c.statblock.legendaryDesc && ssb.legendaryDesc) c.statblock.legendaryDesc = ssb.legendaryDesc;
+        } });
+    });
+  });
+  if (src.spellAbility || src.spellDc != null || src.spellAttack != null) {
+    items.push({ group: 'Spellcasting', label: 'Ability, save DC & attack',
+      detail: [src.spellAbility && src.spellAbility.toUpperCase(), src.spellDc != null && `DC ${src.spellDc}`, src.spellAttack != null && `${signed(src.spellAttack)} to hit`]
+        .filter(Boolean).join(' · ') + (target.spellAbility || target.spellDc != null ? ' · replaces yours' : ''),
+      apply: c => {
+        if (src.spellAbility) c.spellAbility = src.spellAbility;
+        if (src.spellDc != null) c.spellDc = src.spellDc;
+        if (src.spellAttack != null) c.spellAttack = src.spellAttack;
+        // No spellcasting text of its own? Bring the source's, so the stat block shows the intro and slot counts
+        const srcTrait = spellcastingTrait(ssb);
+        if (srcTrait && !spellcastingTrait(c.statblock)) (c.statblock.traits = c.statblock.traits || []).push(structuredClone(srcTrait));
+      } });
+  }
+  const resolved = k => spellInfo(k)?.key || k;
+  // Spells the target only has as Spellcasting text still count as "already has"
+  const textSpells = !(target.spells || []).length ? new Set((parseSpellcasting(tsb)?.spells || []).map(s => nameKey(s.name))) : new Set();
+  (src.spells || []).forEach(sp => {
+    const has = (target.spells || []).some(x => resolved(x.key) === resolved(sp.key)) || textSpells.has(nameKey(spellInfo(sp.key)?.name || sp.name));
+    items.push({ group: 'Spellcasting', label: spellInfo(sp.key)?.name || sp.name,
+      detail: has ? 'already has this' : [sp.level === 0 ? 'Cantrip' : `Level ${sp.level}`, sp.note, sp.key.startsWith('u:') && 'not linked'].filter(Boolean).join(' · '),
+      disabled: has, apply: c => { c.spells = c.spells || []; if (!c.spells.some(x => resolved(x.key) === resolved(sp.key))) c.spells.push(structuredClone(sp)); } });
+  });
+  return items;
+}
+
+// A source for merging: Open5e creatures (with their spells linked), presets, or your own creatures
+async function mergeSourceFromOpen5e(slug) {
+  const sb = await bestiaryClient.creature(slug);
+  const sp = await spellsFromStatblock(sb);
+  return { sb, spells: sp?.spells || [], spellAbility: sp?.ability || '', spellDc: sp?.dc ?? null, spellAttack: sp?.attack ?? null };
+}
+async function mergeSourceFromCreature(c) {
+  const src = { sb: c.statblock || {}, spells: c.spells || [], spellAbility: c.spellAbility || '', spellDc: c.spellDc ?? null, spellAttack: c.spellAttack ?? null };
+  // Spells only written in its Spellcasting trait (older imports and presets): read them so they can be merged
+  if (!src.spells.length && parseSpellcasting(src.sb)) {
+    const sp = await spellsFromStatblock(src.sb);
+    src.spells = sp?.spells || [];
+    src.spellAbility = src.spellAbility || sp?.ability || '';
+    src.spellDc = src.spellDc ?? sp?.dc ?? null;
+    src.spellAttack = src.spellAttack ?? sp?.attack ?? null;
+  }
+  return src;
+}
+
+// Spellcasting in a stat block: ability, DC and attack, then spells by level as clickable names.// Spellcasting in a stat block: ability, DC and attack, then spells by level as clickable names.
+// Prepared spells are bold; click a name to open its card.
+function renderSpellcasting(creature) {
+  const sec = el('div', 'sb-section sb-spells');
+  sec.append(el('h4', 'sb-heading', 'Spellcasting'));
+  const parsed = parseSpellcasting(creature.statblock);
+  if (parsed?.intro && creature.spells?.length) sec.append(el('p', 'sb-desc', parsed.intro));
+  const bits = parsed?.intro && creature.spells?.length ? [] : [creature.spellAbility && `${creature.spellAbility.toUpperCase()}`,
+    creature.spellDc != null && `spell save DC ${creature.spellDc}`,
+    creature.spellAttack != null && `${signed(creature.spellAttack)} to hit with spell attacks`].filter(Boolean);
+  if (bits.length) sec.append(el('p', 'sb-line', bits.join(' · ')));
+  const byLevel = new Map();
+  (creature.spells || []).forEach(sp => {
+    const info = spellInfo(sp.key);
+    const level = info?.level ?? sp.level ?? 0;
+    if (!byLevel.has(level)) byLevel.set(level, []);
+    byLevel.get(level).push({ ...sp, name: info?.name || sp.name, level });
+  });
+  [...byLevel.keys()].sort((a, b) => a - b).forEach(level => {
+    const p = el('p', 'sb-spell-level');
+    const slots = parsed?.levelNotes?.[level];
+    p.append(el('strong', '', `${level === 0 ? 'Cantrips' : `${ordinal(level)} level`}${slots ? ` (${slots})` : ''}: `));
+    byLevel.get(level).sort((a, b) => a.name.localeCompare(b.name)).forEach((sp, i) => {
+      if (i) p.append(document.createTextNode(', '));
+      if (sp.key.startsWith('u:')) {
+        // Not linked to a Spellbook spell yet: show the name, link it in the Bestiary editor
+        const u = el('span', 'spell-chip is-unlinked', sp.name);
+        u.title = 'Not linked to a spell in your Spellbook yet (link it in the Bestiary editor)';
+        p.append(u);
+      } else {
+        const b = el('button', `spell-chip${sp.prepared ? ' is-prepared' : ''}`, sp.name);
+        b.type = 'button';
+        b.title = `${sp.prepared ? 'Prepared · ' : ''}Open ${sp.name}`;
+        b.addEventListener('click', () => openSpellCard(sp.key));
+        p.append(b);
+      }
+      if (sp.note) p.append(el('span', 'spell-note', ` (${sp.note})`));
+    });
+    sec.append(p);
+  });
+  return sec;
+}
+
+// What a creature from your bestiary shows in the tracker and the bestiary menu:
+// its stat block (your copy, with the tracker numbers on top) plus your notes and Notion links
+function renderCreatureBlock(creature) {
+  const sb = creature.statblock || {};
+  const linkedSpells = creature.spells?.length > 0;
+  const block = renderStatBlock({
+    ...sb,
+    traits: linkedSpells ? (sb.traits || []).filter(t => t !== spellcastingTrait(sb)) : sb.traits,
+    name: creatureName(creature),
+    ac: creature.ac ?? sb.ac,
+    hp: creature.hp ?? sb.hp,
+    hitDice: creature.hitDice || sb.hitDice,
+    cr: creature.cr || sb.cr,
+    xp: xpForCr(creature.cr) ?? sb.xp,
+    initBonus: creature.initBonus,
+    homebrew: !creature.source,
+  });
+  const casts = creature.spells?.length || creature.spellAbility;
+  if (isCharacter(creature)) {
+    const bits = [
+      creature.level ? `Level ${creature.level}${creature.className ? ` ${creature.className}` : ''}` : creature.className,
+      creature.player && `Played by ${creature.player}`,
+      creature.passive != null && `Passive Perception ${creature.passive}`,
+      !casts && creature.spellDc != null && `Spell save DC ${creature.spellDc}`,
+    ].filter(Boolean);
+    const line = el('div', 'sb-character');
+    line.append(el('span', 'tag party-tag', creature.inParty ? 'Party' : 'PC'), document.createTextNode(bits.join(' · ') || 'Add level, class and player in Edit'));
+    block.insertBefore(line, block.children[2] || null);
+  }
+  if (casts) {
+    // Where the original trait sat: just before Actions
+    const actionsHead = [...block.querySelectorAll('.sb-heading')].find(h => h.textContent === 'Actions');
+    const section = renderSpellcasting(creature);
+    if (actionsHead) block.insertBefore(section, actionsHead.parentElement); else block.append(section);
+  }
+  if (creature.notes) {
+    const notes = el('div', 'sb-section');
+    notes.append(el('h4', 'sb-heading', 'Your notes'), el('p', 'sb-desc', creature.notes));
+    block.append(notes);
+  }
+  const links = notionLinks(findCreaturePage(creature.notionId));
+  if (links.length) {
+    const row = el('div', 'sb-links');
+    row.append(...links);
+    block.append(row);
+  }
+  return block;
+}
+
+/* ---- Encounter math (2014 DMG, as in Kobold Fight Club) ---- */
+// XP thresholds per character level: [Easy, Medium, Hard, Deadly]
+const XP_THRESHOLDS = {
+  1: [25, 50, 75, 100], 2: [50, 100, 150, 200], 3: [75, 150, 225, 400], 4: [125, 250, 375, 500],
+  5: [250, 500, 750, 1100], 6: [300, 600, 900, 1400], 7: [350, 750, 1100, 1700], 8: [450, 900, 1400, 2100],
+  9: [550, 1100, 1600, 2400], 10: [600, 1200, 1900, 2800], 11: [800, 1600, 2400, 3600], 12: [1000, 2000, 3000, 4500],
+  13: [1100, 2200, 3400, 5100], 14: [1250, 2500, 3800, 5700], 15: [1400, 2800, 4300, 6400], 16: [1600, 3200, 4800, 7200],
+  17: [2000, 3900, 5900, 8800], 18: [2100, 4200, 6300, 9500], 19: [2400, 4900, 7300, 10900], 20: [2800, 5700, 8500, 12700],
+};
+const MULTIPLIERS = [0.5, 1, 1.5, 2, 2.5, 3, 4, 5];
+const DIFFICULTIES = ['Easy', 'Medium', 'Hard', 'Deadly'];
+
+const sideOf = c => (['party', 'ally', 'hostile'].includes(c.side) ? c.side : 'hostile');
+// A combatant's CR: live from your bestiary when it came from there, else what was copied when added
+const combatantCr = c => (c.source?.type === 'library' ? findCreature(c.source.slug)?.cr : null) || c.cr || '';
+
+// The party: the combatants marked Party, at their levels. Levels come live from the bestiary
+// when the combatant came from there, so a level set in the Bestiary applies to every fight.
+const combatantLevel = c => (c.source?.type === 'library' ? findCreature(c.source.slug)?.level : null) ?? c.level ?? null;
+function partyLevels(list) {
+  const members = list.filter(c => sideOf(c) === 'party');
+  return {
+    members,
+    levels: members.map(c => Math.min(20, Math.max(1, combatantLevel(c) || 1))),
+    missingLevel: members.filter(c => !combatantLevel(c)).length,
+  };
+}
+
+function encounterMath(list, { includeHidden }) {
+  const { levels } = partyLevels(list);
+  const hostiles = list.filter(c => sideOf(c) === 'hostile' && (includeHidden || !c.hidden));
+  const counted = hostiles.filter(c => xpForCr(combatantCr(c)) !== null);
+  const rawXp = counted.reduce((sum, c) => sum + xpForCr(combatantCr(c)), 0);
+  // Multiplier by number of monsters, shifted for small (<3) or large (6+) parties
+  const n = counted.length;
+  let idx = n === 0 ? 1 : n === 1 ? 1 : n === 2 ? 2 : n <= 6 ? 3 : n <= 10 ? 4 : n <= 14 ? 5 : 6;
+  if (levels.length < 3) idx += 1;
+  else if (levels.length >= 6) idx -= 1;
+  const multiplier = MULTIPLIERS[Math.min(MULTIPLIERS.length - 1, Math.max(0, idx))];
+  const adjusted = Math.round(rawXp * multiplier);
+  const thresholds = [0, 1, 2, 3].map(i => levels.reduce((sum, lv) => sum + XP_THRESHOLDS[lv][i], 0));
+  let difficulty = levels.length ? 'Trivial' : 'No party';
+  if (levels.length) thresholds.forEach((t, i) => { if (adjusted >= t) difficulty = DIFFICULTIES[i]; });
+  return {
+    party: levels.length, hostiles: hostiles.length, counted: n, missingCr: hostiles.length - n,
+    rawXp, multiplier, adjusted, thresholds, difficulty,
+    perPlayer: levels.length ? Math.floor(rawXp / levels.length) : 0,
+  };
+}
+
+const InitiativeTracker = L.Control.extend({
+  options: { position: 'bottomright' },
+  onAdd() {
+    const root = L.DomUtil.create('section', 'init-tracker');
+    root.setAttribute('aria-label', 'Initiative tracker');
+    L.DomEvent.disableClickPropagation(root);
+    L.DomEvent.disableScrollPropagation(root);
+    root.addEventListener('click', e => e.stopPropagation());
+    const openNotes = new Set();
+    let hpTargetId = null;   // who the Damage / Heal bar points at
+
+    // Health band from current vs max HP: healthy > 1/2, bloodied <= 1/2, critical <= 1/4, down at 0
+    const hpState = c => {
+      if (c.hp === null || c.hp === undefined) return '';
+      if (c.hp <= 0) return 'hp-down';
+      if (!c.maxHp) return '';
+      const ratio = c.hp / c.maxHp;
+      return ratio <= 0.25 ? 'hp-critical' : ratio <= 0.5 ? 'hp-bloodied' : 'hp-healthy';
+    };
+    const HP_STATES = ['hp-healthy', 'hp-bloodied', 'hp-critical', 'hp-down'];
+    const paintHp = (row, c) => {
+      row.classList.remove(...HP_STATES);
+      const s = hpState(c);
+      if (s) row.classList.add(s);
+    };
+    // Apply damage (negative) or healing (positive): never below 0, healing never past max
+    const applyHp = (c, delta) => {
+      const base = c.hp ?? c.maxHp ?? 0;
+      let next = Math.max(0, base + delta);
+      if (delta > 0 && c.maxHp) next = Math.min(next, Math.max(c.maxHp, base));
+      c.hp = next;
+    };
+
+    const numOrNull = v => (v === '' || v == null || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
+    const btn = (text, label, onClick, cls = 'icon-btn') => {
+      const b = el('button', cls, text);
+      b.type = 'button';
+      if (label) { b.setAttribute('aria-label', label); b.title = label; }
+      b.addEventListener('click', onClick);
+      return b;
+    };
+
+    // "+ Add party": everyone tagged Party in the Bestiary who isn't in initiative yet
+    const partyButton = () => {
+      const count = dm.data.bestiary.filter(c => c.inParty).length;
+      const b = btn('+ Add party', count ? `Add the ${count} Party member${count === 1 ? '' : 's'} not already in initiative`
+        : 'Tag creatures as Party members in the Bestiary to add them all at once', () => {
+        const { added, total } = addParty();
+        if (!total) { openBestiary(); return; }
+        if (!added) { b.textContent = 'Party already in'; setTimeout(() => { b.textContent = '+ Add party'; }, 1500); }
+      }, 'btn party-btn-add');
+      return b;
+    };
+
+    // Large view: search your bestiary to add combatants. "3 goblin" adds three;
+    // any name not in your bestiary can be added as a custom combatant.
+    const bestiarySearch = host => {
+      const wrap = el('div', 'init-search');
+      const combo = el('div', 'combo');
+      const input = el('input', 'combo-input init-input add-input');
+      input.type = 'text';
+      input.id = 'init-bestiary-search';
+      input.placeholder = 'Add from your bestiary…  ("3 goblin" adds three)';
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.setAttribute('role', 'combobox');
+      input.setAttribute('aria-label', 'Add a combatant from your bestiary');
+      input.setAttribute('aria-autocomplete', 'list');
+      input.setAttribute('aria-expanded', 'false');
+      const list = el('ul', 'combo-list');
+      list.id = 'init-bestiary-search-list';
+      list.setAttribute('role', 'listbox');
+      list.hidden = true;
+      input.setAttribute('aria-controls', list.id);
+      combo.append(input, list);
+
+      const parse = q => {
+        const m = q.trim().match(/^(\d{1,2})\s*[x×]?\s+(.+)$/i);
+        return m ? { count: Math.min(20, Math.max(1, Number(m[1]))), term: m[2].trim() } : { count: 1, term: q.trim() };
+      };
+      const box = createCombobox({
+        input,
+        list,
+        getOptions(query) {
+          const { count, term } = parse(query);
+          const q = nameKey(term);
+          const found = dm.data.bestiary
+            .filter(c => !q || nameKey(creatureName(c)).includes(q))
+            .sort((a, b) => creatureName(a).localeCompare(creatureName(b)));
+          const options = found.slice(0, 50).map(c => ({
+            kind: 'creature', id: c.id, count,
+            label: `${creatureName(c)}${count > 1 ? ` ×${count}` : ''}`,
+            detail: [c.cr && `CR ${c.cr}`, c.ac != null && `AC ${c.ac}`, c.hp != null && `HP ${c.hp}`].filter(Boolean).join(' · '),
+          }));
+          if (term) options.push({ kind: 'custom', name: term, count, className: 'is-none',
+            label: `Add "${term}"${count > 1 ? ` ×${count}` : ''} as a custom combatant` });
+          const notes = [];
+          if (!dm.data.bestiary.length) notes.push('Your bestiary is empty. Open it with 📖 to import or create creatures.');
+          else if (term && !found.length) notes.push('No creatures in your bestiary match.');
+          return { options, notes };
+        },
+        onChoose(opt) {
+          if (opt.kind === 'creature') {
+            const creature = findCreature(opt.id);
+            if (creature) addFromBestiary(creature, opt.count);
+          } else {
+            dm.update(d => {
+              const { names, rename } = nextNames(d.tracker.combatants, opt.name, opt.count);
+              if (rename) { const t = d.tracker.combatants.find(x => x.id === rename.id); if (t) t.name = rename.name; }
+              names.forEach(n => d.tracker.combatants.push({ id: newId(), name: n, init: null, hp: null, maxHp: null, ac: null, notes: '', source: null, side: 'party', hidden: false, level: null, cr: '' }));
+            });
+          }
+          host.querySelector('.add-input')?.focus();
+        },
+      });
+      input.addEventListener('focus', () => box.open());
+      wrap.append(combo, partyButton(), btn('+ Blank', 'Add an empty row', () => {
+        dm.update(d => { d.tracker.combatants.push({ id: newId(), name: '', init: null, hp: null, maxHp: null, ac: null, notes: '', source: null, side: 'party', hidden: false, level: null, cr: '' }); });
+        host.querySelector('.init-table .init-row:last-of-type .init-name')?.focus();
+      }, 'btn'));
+      return wrap;
+    };
+
+    // Encounter difficulty: a one-line summary that expands into the full breakdown
+    const encounterPanel = (list, large) => {
+      const wrap = el('div', 'enc');
+      const open = panelOpen(`encounter-${large ? 'large' : 'corner'}`, large);
+      const all = encounterMath(list, { includeHidden: true });
+      const now = encounterMath(list, { includeHidden: false });
+      const anyHidden = list.some(c => c.hidden && sideOf(c) === 'hostile');
+
+      const summary = el('button', 'enc-summary');
+      summary.type = 'button';
+      summary.setAttribute('aria-expanded', String(open));
+      const badge = (math, label) => {
+        const b = el('span', `enc-badge diff-${math.difficulty.toLowerCase()}`);
+        b.append(el('strong', '', math.difficulty), document.createTextNode(` ${math.adjusted.toLocaleString()} XP${label ? ` ${label}` : ''}`));
+        return b;
+      };
+      summary.append(el('span', 'enc-title', 'Encounter'), badge(all, anyHidden ? 'all' : ''));
+      if (anyHidden) summary.append(badge(now, 'in fight'));
+      summary.append(el('span', 'enc-caret', open ? '▾' : '▸'));
+      summary.addEventListener('click', () => { setPanelOpen(`encounter-${large ? 'large' : 'corner'}`, !open); render(); });
+      wrap.append(summary);
+      if (!open) return wrap;
+
+      const body = el('div', 'enc-body');
+      // Party: whoever is marked Party in the tracker. Levels edit the Bestiary entry when there is one.
+      const { members, missingLevel } = partyLevels(list);
+      const partyRow = el('div', 'enc-party');
+      partyRow.append(el('span', 'enc-label', `Party (${members.length})`));
+      if (!members.length) {
+        partyRow.append(el('span', 'enc-hint', 'No one is marked Party. Use + Add party, or click a row\'s chip until it shows P.'));
+      }
+      members.forEach(c => {
+        const lab = el('label', 'enc-level');
+        lab.append(el('span', '', c.name || 'Unnamed'));
+        const inp = el('input', 'init-input');
+        inp.type = 'number'; inp.min = '1'; inp.max = '20';
+        inp.value = combatantLevel(c) ?? '';
+        inp.placeholder = '?';
+        inp.setAttribute('aria-label', `Level of ${c.name || 'party member'}`);
+        inp.addEventListener('change', () => dm.update(d => {
+          const level = Math.min(20, Math.max(1, Math.round(Number(inp.value) || 1)));
+          const creature = c.source?.type === 'library' ? d.bestiary.find(x => x.id === c.source.slug) : null;
+          if (creature) creature.level = level;
+          const t = d.tracker.combatants.find(x => x.id === c.id);
+          if (t) t.level = level;
+        }));
+        lab.append(inp);
+        partyRow.append(lab);
+      });
+      if (missingLevel) partyRow.append(el('span', 'enc-warn', `${missingLevel} without a level (counted as level 1)`));
+      body.append(partyRow);
+
+      // Numbers: everyone vs. in the fight now
+      const table = el('div', 'enc-table');
+      const cols = anyHidden ? [['All (incl. hidden)', all], ['In the fight now', now]] : [['Encounter', all]];
+      const rowOf = (label, f) => { const r = el('div', 'enc-row'); r.append(el('span', 'enc-k', label), ...cols.map(([, m]) => el('span', 'enc-v', f(m)))); return r; };
+      const head = el('div', 'enc-row enc-head'); head.append(el('span', ''), ...cols.map(([t]) => el('span', 'enc-v', t)));
+      table.append(head,
+        rowOf('Difficulty', m => m.difficulty),
+        rowOf('Hostiles counted', m => `${m.counted}${m.missingCr ? ` (+${m.missingCr} without CR)` : ''}`),
+        rowOf('XP (raw)', m => m.rawXp.toLocaleString()),
+        rowOf('Multiplier', m => `×${m.multiplier}`),
+        rowOf('Adjusted XP', m => m.adjusted.toLocaleString()),
+        rowOf('XP per player', m => m.perPlayer.toLocaleString()),
+      );
+      body.append(table);
+
+      // Party thresholds
+      const th = el('div', 'enc-thresholds');
+      all.thresholds.forEach((t, i) => {
+        const cell = el('span', `enc-th diff-${DIFFICULTIES[i].toLowerCase()}`);
+        cell.append(el('strong', '', DIFFICULTIES[i]), document.createTextNode(` ${t.toLocaleString()}`));
+        th.append(cell);
+      });
+      body.append(th);
+      if (all.missingCr) body.append(el('p', 'enc-warn', `${all.missingCr} hostile${all.missingCr === 1 ? ' has' : 's have'} no CR, so ${all.missingCr === 1 ? "it isn't" : "they aren't"} counted. Add them from the bestiary, or set a CR there.`));
+      body.append(el('p', 'enc-note', `2014 DMG rules · ${all.party} player${all.party === 1 ? '' : 's'} · allies don't count`));
+      wrap.append(body);
+      return wrap;
+    };
+
+    // Fill a Damage / Heal pill from a combatant (name, HP, health color)
+    const fillPill = (pill, c) => {
+      pill.className = `hp-pill ${hpState(c)}`;
+      pill.replaceChildren(el('span', 'hp-pill-name', c.name || 'Unnamed'));
+      if (c.hp !== null && c.hp !== undefined) {
+        pill.append(el('span', 'hp-pill-hp', c.maxHp ? `${c.hp}/${c.maxHp}` : `${c.hp}`));
+      }
+    };
+
+    // Move the turn forward or back, skipping hidden combatants (rounds count on wrap-around)
+    const step = (tracker, dir) => {
+      const all = tracker.combatants;
+      if (!all.some(c => !c.hidden)) return;
+      let i = tracker.turn;
+      do {
+        i += dir;
+        if (i >= all.length) { i = 0; tracker.round += 1; }
+        if (i < 0) { i = all.length - 1; tracker.round = Math.max(1, tracker.round - 1); }
+      } while (all[i].hidden);
+      tracker.turn = i;
+    };
+
+    // Builds the whole tracker into `root`: the corner panel, or the large centered view
+    const build = (root, large) => {
+      // Field edits don't redraw (so typing isn't interrupted), so update that one pill directly
+      const syncPill = id => {
+        const c = dm.data.tracker.combatants.find(x => x.id === id);
+        const pill = root.querySelector(`.hp-pill[data-id="${CSS.escape(id)}"]`);
+        if (c && pill) fillPill(pill, c);
+      };
+      const open = large || panelOpen('initiative', !window.matchMedia('(max-width: 640px)').matches);
+      const { tracker, encounters } = dm.data;
+      const list = tracker.combatants;
+      root.replaceChildren();
+      root.classList.toggle('is-min', !open);
+
+      if (!open) {
+        root.append(btn(`⚔ Initiative${list.length ? ` (${list.length})` : ''}`, 'Show initiative tracker',
+          () => { setPanelOpen('initiative', true); render(); }, 'btn init-open'));
+        render.statusOnly = null;
+        return;
+      }
+
+      // Header: round, turn controls, minimize
+      const head = el('header', 'dm-head');
+      const title = el('h2', 'dm-title', 'Initiative');
+      title.append(el('span', 'init-round', `Round ${tracker.round}`));
+      const tools = el('div', 'dm-tools');
+      tools.append(
+        btn('◀', 'Previous turn', () => dm.update(d => step(d.tracker, -1))),
+        btn('Next ▶', 'Next turn', () => dm.update(d => step(d.tracker, 1)), 'btn primary'),
+        btn('Sort', 'Sort by initiative (highest first)', () => dm.update(d => {
+          const currentId = d.tracker.combatants[d.tracker.turn]?.id;
+          d.tracker.combatants.sort((a, b) => (b.init ?? -Infinity) - (a.init ?? -Infinity));
+          d.tracker.turn = Math.max(0, d.tracker.combatants.findIndex(c => c.id === currentId));
+        }), 'btn'),
+        btn('📖', 'Open your bestiary', () => openBestiary()),
+        btn('✨', 'Open your spellbook', () => openSpellbook()),
+        ...(large
+          ? [btn('Close', 'Close the large view', () => dialog?.close(), 'btn')]
+          : [btn('⤢', 'Open a larger view', openLarge),
+             btn('–', 'Minimize initiative tracker', () => { setPanelOpen('initiative', false); render(); })]),
+      );
+      head.append(title, tools);
+      root.append(head);
+      if (large) root.append(bestiarySearch(root));
+
+      // Rows
+      const table = el('div', 'init-table');
+      const cols = el('div', 'init-row init-cols');
+      ['', '', 'Init', 'Name', 'HP', 'Max', 'AC', '', '', '', ''].forEach(t => cols.append(el('span', '', t)));
+      table.append(cols);
+      if (!list.length) table.append(el('p', 'dm-empty', 'Add combatants, or load a saved encounter below.'));
+
+      list.forEach((c, i) => {
+        const row = el('div', `init-row${i === tracker.turn ? ' is-turn' : ''}${c.hidden ? ' is-hidden' : ''}`);
+        paintHp(row, c);
+        row.append(el('span', 'turn-mark', i === tracker.turn ? '▶' : ''));
+        // Side chip: click to cycle Party → Ally → Hostile
+        const side = sideOf(c);
+        const SIDES = { party: ['P', 'Party'], ally: ['A', 'Ally'], hostile: ['H', 'Hostile'] };
+        const next = { party: 'ally', ally: 'hostile', hostile: 'party' }[side];
+        row.append(btn(SIDES[side][0], `${c.name || 'Combatant'} is ${SIDES[side][1]}; click for ${SIDES[next][1]}`, () => dm.update(d => {
+          const t = d.tracker.combatants.find(x => x.id === c.id);
+          if (t) t.side = next;
+        }), `side-chip side-${side}`));
+
+        const field = (key, label, width, opts = {}) => {
+          const input = el('input', `init-input ${opts.cls || ''}`);
+          input.type = 'text';
+          input.inputMode = opts.text ? 'text' : 'numeric';
+          input.value = c[key] ?? '';
+          input.setAttribute('aria-label', `${label} for ${c.name || 'combatant'}`);
+          input.placeholder = opts.placeholder || '';
+          input.addEventListener('change', () => {
+            const raw = input.value.trim();
+            dm.update(d => {
+              const target = d.tracker.combatants.find(x => x.id === c.id);
+              if (!target) return;
+              if (opts.text) target[key] = raw;
+              else if (key === 'hp' && /^[+-]\d+$/.test(raw)) {
+                // "-7" deals 7 damage, "+5" heals 5
+                applyHp(target, Number(raw));
+                input.value = target.hp;
+              } else target[key] = numOrNull(raw);
+              paintHp(row, target);
+            }, { quiet: true });
+            syncPill(c.id);
+          });
+          input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
+          return input;
+        };
+
+        row.append(
+          field('init', 'Initiative', 0),
+          field('name', 'Name', 0, { text: true, placeholder: 'Name', cls: 'init-name' }),
+          field('hp', 'Current HP', 0, { placeholder: '–' }),
+          field('maxHp', 'Max HP', 0, { placeholder: '–' }),
+          field('ac', 'AC', 0, { placeholder: '–' }),
+          (() => {
+            // Move up / down to break ties (e.g. by Dex). The current turn stays with the same combatant.
+            const move = dir => dm.update(d => {
+              const all = d.tracker.combatants;
+              const idx = all.findIndex(x => x.id === c.id);
+              const to = idx + dir;
+              if (to < 0 || to >= all.length) return;
+              const currentId = all[d.tracker.turn]?.id;
+              [all[idx], all[to]] = [all[to], all[idx]];
+              d.tracker.turn = Math.max(0, all.findIndex(x => x.id === currentId));
+            });
+            const wrap = el('span', 'init-move');
+            const up = btn('▲', `Move ${c.name || 'combatant'} up`, () => move(-1), 'move-btn');
+            const down = btn('▼', `Move ${c.name || 'combatant'} down`, () => move(1), 'move-btn');
+            up.disabled = i === 0;
+            down.disabled = i === list.length - 1;
+            wrap.append(up, down);
+            return wrap;
+          })(),
+          btn(c.hidden ? '◌' : '◉', c.hidden ? `Show ${c.name || 'combatant'} (bring into the fight)` : `Hide ${c.name || 'combatant'} (staged; skipped in turns, still counted in encounter math)`,
+            () => dm.update(d => { const t = d.tracker.combatants.find(x => x.id === c.id); if (t) t.hidden = !t.hidden; }),
+            `icon-btn eye-btn${c.hidden ? ' is-off' : ''}`),
+          btn(openNotes.has(c.id) ? '▾' : (c.notes ? '✎' : '▸'),
+            `${c.source ? 'Stat block and notes' : 'Notes'} for ${c.name || 'combatant'}`, () => {
+            openNotes.has(c.id) ? openNotes.delete(c.id) : openNotes.add(c.id);
+            render();
+          }, `icon-btn${c.notes ? ' has-notes' : ''}${c.source ? ' has-statblock' : ''}`),
+          btn('×', `Remove ${c.name || 'combatant'}`, () => dm.update(d => {
+            const idx = d.tracker.combatants.findIndex(x => x.id === c.id);
+            d.tracker.combatants.splice(idx, 1);
+            if (idx < d.tracker.turn) d.tracker.turn -= 1;
+            d.tracker.turn = Math.min(d.tracker.turn, Math.max(0, d.tracker.combatants.length - 1));
+          }), 'icon-btn danger'),
+        );
+        table.append(row);
+
+        if (openNotes.has(c.id)) {
+          // Creatures from your bestiary show their stat block above the notes
+          if (c.source?.type === 'library') {
+            const creature = findCreature(c.source.slug);
+            const holder = el('div', 'statblock-holder');
+            if (creature) holder.append(renderCreatureBlock(creature));
+            else holder.textContent = 'This creature is no longer in your bestiary.';
+            table.append(holder);
+          } else if (c.source?.type === 'open5e' && c.source.slug) {
+            const holder = el('div', 'statblock-holder', 'Loading stat block…');
+            bestiaryClient.creature(c.source.slug)
+              .then(sb => holder.replaceChildren(renderStatBlock(sb)))
+              .catch(err => { holder.textContent = `Couldn't load the stat block (${err.message}).`; });
+            table.append(holder);
+          }
+          const notes = el('textarea', 'init-notes');
+          notes.rows = 3;
+          notes.placeholder = 'Abilities, resistances, reminders…';
+          notes.value = c.notes || '';
+          notes.setAttribute('aria-label', `Notes for ${c.name || 'combatant'}`);
+          notes.addEventListener('change', () => dm.update(d => {
+            const target = d.tracker.combatants.find(x => x.id === c.id);
+            if (target) target.notes = notes.value;
+          }, { quiet: true }));
+          table.append(notes);
+        }
+      });
+      root.append(table);
+      if (large && list.length) root.append(encounterPanel(list, large));
+
+      // Damage / Heal: pick someone, type an amount, press a button (Enter = Damage). Hidden combatants are left out.
+      const active = list.filter(c => !c.hidden);
+      if (active.length) {
+        if (!active.some(c => c.id === hpTargetId)) hpTargetId = (list[tracker.turn] && !list[tracker.turn].hidden ? list[tracker.turn].id : active[0].id);
+        const bar = el('div', 'hp-adjust');
+        // One pill per combatant: click to choose who the Damage / Heal buttons apply to
+        const pills = el('div', 'hp-pills');
+        pills.setAttribute('role', 'group');
+        pills.setAttribute('aria-label', 'Choose who to damage or heal');
+        active.forEach(c => {
+          const pill = el('button');
+          pill.type = 'button';
+          pill.dataset.id = c.id;
+          pill.setAttribute('aria-pressed', String(c.id === hpTargetId));
+          fillPill(pill, c);
+          pill.addEventListener('click', () => {
+            hpTargetId = c.id;
+            pills.querySelectorAll('.hp-pill').forEach(p => p.setAttribute('aria-pressed', String(p.dataset.id === c.id)));
+            root.querySelector('.hp-amount')?.focus();
+          });
+          pills.append(pill);
+        });
+        const controls = el('div', 'hp-controls');
+        const amount = el('input', 'init-input hp-amount');
+        amount.type = 'number';
+        amount.min = '0';
+        amount.inputMode = 'numeric';
+        amount.placeholder = 'HP';
+        amount.setAttribute('aria-label', 'Amount of HP');
+        const apply = sign => {
+          const n = Math.abs(Math.round(Number(amount.value)));
+          if (!n) { amount.focus(); return; }
+          dm.update(d => {
+            const target = d.tracker.combatants.find(x => x.id === hpTargetId);
+            if (target) applyHp(target, sign * n);
+          });
+          root.querySelector('.hp-amount')?.focus();
+        };
+        amount.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); apply(-1); } });
+        controls.append(amount,
+          btn('− Damage', 'Subtract HP', () => apply(-1), 'btn danger'),
+          btn('+ Heal', 'Add HP (up to max)', () => apply(1), 'btn heal'));
+        bar.append(pills, controls);
+        root.append(bar);
+      }
+
+      if (!large) {
+        const addRow = el('div', 'init-add-buttons');
+        addRow.append(
+          btn('+ Add combatant', null, () => {
+            dm.update(d => { d.tracker.combatants.push({ id: newId(), name: '', init: null, hp: null, maxHp: null, ac: null, notes: '', source: null, side: 'party', hidden: false, level: null, cr: '' }); });
+            root.querySelector('.init-table .init-row:last-of-type .init-name')?.focus();
+          }, 'btn init-add'),
+          partyButton(),
+        );
+        root.append(addRow);
+      }
+
+
+      // Saved encounters
+      const enc = el('div', 'init-encounters');
+      const select = el('select', 'init-select');
+      select.setAttribute('aria-label', 'Saved encounters');
+      select.append(new Option(encounters.length ? 'Saved encounters…' : 'No saved encounters', ''));
+      encounters.forEach(e => select.append(new Option(`${e.name} (${e.combatants.length})`, e.id)));
+      const chosen = () => encounters.find(e => e.id === select.value);
+
+      enc.append(
+        select,
+        btn('Load', 'Load the selected encounter', () => {
+          const e = chosen();
+          if (!e) return;
+          if (list.length && !confirm(`Replace the current initiative with "${e.name}"?`)) return;
+          dm.update(d => {
+            d.tracker = { round: 1, turn: 0, combatants: e.combatants.map(c => ({ ...structuredClone(c), id: newId() })) };
+          });
+        }, 'btn'),
+        btn('Delete', 'Delete the selected saved encounter', () => {
+          const e = chosen();
+          if (!e || !confirm(`Delete the saved encounter "${e.name}"?`)) return;
+          dm.update(d => { d.encounters = d.encounters.filter(x => x.id !== e.id); });
+          dm.save();
+        }, 'btn danger'),
+      );
+      root.append(enc);
+
+      const foot = el('div', 'init-foot');
+      foot.append(
+        btn('Save as encounter…', 'Save the current combatants as a reusable encounter', () => {
+          if (!list.length) return;
+          const name = (prompt('Name this encounter') || '').trim();
+          if (!name) return;
+          const existing = encounters.find(e => e.name.toLowerCase() === name.toLowerCase());
+          if (existing && !confirm(`Replace the saved encounter "${existing.name}"?`)) return;
+          dm.update(d => {
+            const saved = { id: existing?.id || newId(), name, savedAt: new Date().toISOString(), combatants: structuredClone(d.tracker.combatants) };
+            d.encounters = [...d.encounters.filter(e => e.id !== saved.id), saved];
+          });
+          dm.save();   // saving an encounter is a deliberate save, so upload it
+        }, 'btn'),
+        btn('Clear', 'Remove everyone from initiative', () => {
+          if (!list.length || !confirm('Clear the initiative tracker?')) return;
+          dm.update(d => { d.tracker = { round: 1, turn: 0, combatants: [] }; });
+        }, 'btn danger'),
+      );
+      const saveRow = saveControls('dm-save-row init-save');
+      foot.append(saveRow);
+      root.append(foot);
+      render.statusOnly = saveRow.refresh;
+    };
+
+    // Large view: the same tracker in a centered modal with bigger text
+    let dialog = null, body = null;
+    function openLarge() {
+      dialog = document.createElement('dialog');
+      dialog.className = 'init-modal';
+      dialog.setAttribute('aria-label', 'Initiative tracker');
+      body = el('section', 'init-tracker is-large');
+      body.tabIndex = -1;   // lets focus rest on the window itself after a rebuild
+      dialog.append(body);
+      document.body.append(dialog);
+      dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });   // click outside to close
+      dialog.addEventListener('close', () => {
+        dialog.remove();
+        dialog = body = null;
+        render();
+      });
+      render();
+      dialog.showModal();
+    }
+
+    const render = () => {
+      if (dialog) {
+        // While the large view is open, the corner just shows a placeholder
+        root.replaceChildren();
+        root.classList.add('is-min');
+        root.append(btn('⚔ Initiative (large view open)', null, () => {}, 'btn init-open'));
+        build(body, true);
+        // A rebuild replaces the button you clicked; keep focus in the window so Escape and Tab still work
+        if (!dialog.contains(document.activeElement)) body.focus({ preventScroll: true });
+      } else {
+        build(root, false);
+      }
+    };
+    dm.subscribe(render);
+    render();
+    return root;
+  },
+});
+
+/* ---- Bestiary menu (DM view) ----
+   Your prepared creatures: import from Open5e or create from scratch, set the
+   numbers the tracker uses, link a Notion page (Hostiles, NPC or PC), and keep notes.
+   Edits are local until you press Save, like everything else. */
+function openBestiary(selectId = null) {
+  if (document.querySelector('dialog.bestiary-modal')) return;
+  let selected = selectId;
+  let editing = false;   // view mode by default; new creatures open in edit mode
+  let filter = '';
+
+  const dialog = document.createElement('dialog');
+  dialog.className = 'bestiary-modal';
+  dialog.setAttribute('aria-labelledby', 'bestiary-title');
+  dialog.innerHTML = `
+    <div class="bst">
+      <header class="bst-head">
+        <h2 id="bestiary-title">Bestiary</h2>
+        <div class="bst-head-tools">
+          <button type="button" class="btn" data-sync title="Refresh the list of Notion pages tagged Hostiles, NPC or PC">Sync Notion</button>
+          <button type="button" class="btn" data-close>Close</button>
+        </div>
+      </header>
+      <div class="bst-body">
+        <aside class="bst-side">
+          <input type="search" class="bst-filter" placeholder="Filter your creatures…" aria-label="Filter your creatures">
+          <ul class="bst-list" aria-label="Your creatures"></ul>
+          <button type="button" class="btn" data-new>+ New creature</button>
+        </aside>
+        <section class="bst-main" aria-live="polite"></section>
+        <aside class="bst-search bst-spellcol" hidden aria-label="Spell">
+          <header class="bst-search-head">
+            <h3>Spell</h3>
+            <button type="button" class="icon-btn" data-spell-close aria-label="Close the spell">✕</button>
+          </header>
+          <div class="bst-spellcol-body"></div>
+        </aside>
+        <aside class="bst-search bst-o5e" hidden aria-label="Search Open5e">
+          <header class="bst-search-head">
+            <h3>Presets &amp; Open5e</h3>
+            <button type="button" class="icon-btn" data-search-close aria-label="Close the search without choosing">✕</button>
+          </header>
+          <input type="search" class="bst-filter" id="bst-search-input" placeholder="Search your presets and Open5e…" aria-label="Search your presets and Open5e" autocomplete="off">
+          <p class="bst-search-status" role="status"></p>
+          <ul class="bst-results" aria-label="Open5e results"></ul>
+        </aside>
+      </div>
+      <footer class="bst-foot"></footer>
+    </div>`;
+  document.body.append(dialog);
+  const $ = s => dialog.querySelector(s);
+  const listEl = $('.bst-list'), mainEl = $('.bst-main');
+
+  // Save controls (the same local-then-Save rule as the rest of the DM view)
+  const saveRow = saveControls('dm-save-row');
+  $('.bst-foot').append(saveRow);
+  const onDmChange = () => { renderList(); saveRow.refresh(); };
+  onDmChange.statusOnly = saveRow.refresh;
+  dm.subscribe(onDmChange);
+
+  const close = () => dialog.close();
+  dialog.addEventListener('close', () => { dm.unsubscribe(onDmChange); dialog.remove(); dm.refresh(); });
+  dialog.addEventListener('click', e => { if (e.target === dialog) close(); });
+  $('[data-close]').addEventListener('click', close);
+
+  function select(id, { edit = false } = {}) { selected = id; editing = edit; renderList(); renderEditor(); }
+
+  function renderList() {
+    const q = nameKey(filter);
+    const creatures = [...dm.data.bestiary].sort((a, b) => creatureName(a).localeCompare(creatureName(b)))
+      .filter(c => !q || nameKey(creatureName(c)).includes(q));
+    listEl.replaceChildren();
+    if (!dm.data.bestiary.length) listEl.append(el('li', 'dm-empty', 'No creatures yet. Import one from Open5e or create a new one.'));
+    else if (!creatures.length) listEl.append(el('li', 'dm-empty', 'No matches.'));
+    creatures.forEach(c => {
+      const li = el('li');
+      const b = el('button', 'bst-item');
+      b.type = 'button';
+      b.setAttribute('aria-pressed', String(c.id === selected));
+      b.append(el('span', 'bst-item-name', creatureName(c)), el('span', 'bst-item-cr', c.cr ? `CR ${c.cr}` : ''));
+      if (c.inParty) b.append(el('span', 'bst-item-party', 'P'));
+      if (c.notionId) b.append(el('span', 'bst-item-linked', '🔗'));
+      b.addEventListener('click', () => select(c.id));
+      li.append(b);
+      listEl.append(li);
+    });
+  }
+
+  // One creature, in view mode (name + stat block + notes) or edit mode (every input)
+  function renderEditor() {
+    const creature = findCreature(selected);
+    const keepScroll = mainEl.scrollTop;
+    mainEl.replaceChildren();
+    mainEl.classList.toggle('is-editing', editing && !!creature);
+    if (!creature) {
+      mainEl.append(el('p', 'bst-empty', 'Pick a creature on the left, or create a new one.'));
+      return;
+    }
+
+    // Change the creature, keep its stored name in sync, then refresh what depends on it
+    const set = (mutate, { redraw = false } = {}) => {
+      dm.update(d => {
+        const c = d.bestiary.find(x => x.id === creature.id);
+        if (!c) return;
+        mutate(c);
+        c.name = creatureName(c);
+        c.xp = xpForCr(c.cr);
+      }, { quiet: true });
+      renderList();
+      if (redraw) renderEditor();
+      else drawPreview();
+    };
+    const setSb = mutate => set(c => { c.statblock = c.statblock || {}; mutate(c.statblock); });
+    const current = () => findCreature(creature.id) || creature;
+
+    const addRow = () => {
+      const row = el('div', 'bst-add-row');
+      const count = el('input', 'init-input bst-count');
+      count.type = 'number'; count.min = '1'; count.max = '20'; count.value = '1';
+      count.setAttribute('aria-label', 'How many to add');
+      const added = el('span', 'bst-added');
+      const addBtn = el('button', 'btn primary', 'Add to initiative');
+      addBtn.type = 'button';
+      addBtn.addEventListener('click', () => {
+        const n = Math.min(20, Math.max(1, Math.round(Number(count.value) || 1)));
+        addFromBestiary(current(), n);
+        added.textContent = `Added ${n} to initiative`;
+        setTimeout(() => { added.textContent = ''; }, 2000);
+      });
+      row.append(count, addBtn, added);
+      return row;
+    };
+
+    // ---------- View mode ----------
+    if (!editing) {
+      const head = el('div', 'bst-view-head');
+      head.append(el('h3', 'bst-view-name', creatureName(creature)));
+      const editBtn = el('button', 'btn', 'Edit');
+      editBtn.type = 'button';
+      editBtn.addEventListener('click', () => { editing = true; renderEditor(); });
+      head.append(editBtn);
+      mainEl.append(head, addRow());
+      const holder = el('div', 'statblock-holder bst-block');
+      holder.append(renderCreatureBlock(creature));
+      mainEl.append(holder);
+      return;
+    }
+
+    // ---------- Edit mode ----------
+    const num = v => (v === '' || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
+    const top = el('div', 'bst-editor-top');
+    const searchBtn = el('button', 'btn', creature.source ? 'Replace from search…' : 'Search presets & Open5e…');
+    searchBtn.type = 'button';
+    searchBtn.dataset.openSearch = '';
+    searchBtn.addEventListener('click', () => openSearch(creatureName(creature) !== 'Unnamed creature' ? creatureName(creature) : ''));
+    top.append(searchBtn);
+    if (creature.source?.type === 'open5e' && creature.source.slug) {
+      const reset = el('button', 'btn', 'Reset to Open5e');
+      reset.type = 'button';
+      reset.title = 'Re-fetch the original stat block and numbers (your name override, notes and Notion link stay)';
+      reset.addEventListener('click', async () => {
+        if (!confirm(`Reset ${creatureName(creature)} to the Open5e stat block? Your edits to stats and actions will be replaced.`)) return;
+        try {
+          const sb = await bestiaryClient.creature(creature.source.slug);
+          set(c => Object.assign(c, { cr: sb.cr, ac: sb.ac, hp: sb.hp, hitDice: sb.hitDice, initBonus: abilityMod(sb.abilities?.dex), statblock: structuredClone(sb) }), { redraw: true });
+          if (parseSpellcasting(sb)) importSpellsFromStatblock(creature.id).then(() => renderEditor());
+        } catch (err) { alert(`Couldn't reach Open5e (${err.message}).`); }
+      });
+      top.append(reset);
+    }
+    const preset = creature.source?.type === 'preset' ? findPreset(creature.source.slug) : null;
+    if (preset) {
+      const resetP = el('button', 'btn', 'Reset to preset');
+      resetP.type = 'button';
+      resetP.title = 'Put the stats and actions back to the saved preset (your name override, notes and Notion link stay)';
+      resetP.addEventListener('click', () => {
+        if (!confirm(`Reset ${creatureName(creature)} to the "${preset.name}" preset? Your edits to stats and actions will be replaced.`)) return;
+        set(c => applyPreset(c, preset), { redraw: true });
+      });
+      top.append(resetP);
+    }
+    const savePreset = el('button', 'btn', 'Save as preset');
+    savePreset.type = 'button';
+    savePreset.title = 'Save this stat block to reuse later; presets show up in search next to Open5e';
+    savePreset.addEventListener('click', () => {
+      const c = current();
+      const name = (prompt('Name this preset (it will show up in search)', creatureName(c)) || '').trim();
+      if (!name) return;
+      const existing = dm.data.presets.find(p => p.name.toLowerCase() === name.toLowerCase());
+      if (existing && !confirm(`Replace the existing "${existing.name}" preset?`)) return;
+      dm.update(d => {
+        const saved = {
+          id: existing?.id || newId(), name, cr: c.cr, xp: xpForCr(c.cr), ac: c.ac, hp: c.hp, hitDice: c.hitDice,
+          initBonus: c.initBonus, source: c.source?.type === 'open5e' ? c.source : null,
+          statblock: { ...structuredClone(c.statblock || {}), name },
+          spellAbility: c.spellAbility || '', spellDc: c.spellDc ?? null, spellAttack: c.spellAttack ?? null,
+          spells: structuredClone(c.spells || []),
+        };
+        d.presets = [...d.presets.filter(p => p.id !== saved.id), saved];
+      }, { quiet: true });
+      savePreset.textContent = 'Saved as preset ✓';
+      setTimeout(() => { savePreset.textContent = 'Save as preset'; }, 1800);
+    });
+    top.append(savePreset);
+    top.append(el('span', 'bst-source', preset ? `From preset: ${preset.name}`
+      : creature.source?.type === 'preset' ? 'From a deleted preset'
+      : creature.source ? `From Open5e${creature.statblock?.source ? `: ${creature.statblock.source}` : ''}` : 'Homebrew'));
+    const done = el('button', 'btn primary bst-done', 'Done');
+    done.type = 'button';
+    done.addEventListener('click', () => { editing = false; renderEditor(); });
+    top.append(done);
+    mainEl.append(top);
+
+    const group = (title) => { const g = el('fieldset', 'bst-group'); g.append(el('legend', '', title)); return g; };
+    const input = (label, value, onChange, { wide = false, cls = '', placeholder = '', inputMode = '' } = {}) => {
+      const lab = el('label', `bst-field ${wide ? 'wide' : ''} ${cls}`);
+      lab.append(el('span', 'bst-label', label));
+      const i = el('input', 'init-input');
+      i.type = 'text';
+      if (inputMode) i.inputMode = inputMode;
+      i.value = value ?? '';
+      i.placeholder = placeholder;
+      i.addEventListener('change', () => onChange(i.value.trim(), i));
+      lab.append(i);
+      return lab;
+    };
+
+    // Name: your override; the placeholder shows what it falls back to
+    const nameGroup = group('Name');
+    const fallback = findCreaturePage(creature.notionId)?.name || creature.statblock?.name || '';
+    const nameField = input('Name', creature.nameOverride, v => {
+      set(c => { c.nameOverride = v; });
+      nameHint.textContent = nameSourceLabel(current());
+    }, { wide: true, placeholder: fallback || 'Name this creature' });
+    const nameHint = el('span', 'bst-hint-line', nameSourceLabel(creature));
+    nameGroup.append(nameField, nameHint);
+    mainEl.append(nameGroup);
+
+    // Notion link (pages tagged Hostiles, NPC or PC)
+    const notion = el('div', 'bst-notion');
+    notion.append(el('span', 'bst-label', 'Notion page (Hostiles, NPC, PC)'));
+    const nCombo = el('div', 'combo');
+    const nInput = el('input', 'combo-input init-input');
+    nInput.type = 'text';
+    nInput.id = 'bst-notion-input';
+    nInput.placeholder = dm.creaturePages.length ? 'Not linked · type to search' : 'No Hostiles, NPC or PC pages found (try Sync Notion)';
+    nInput.autocomplete = 'off';
+    nInput.setAttribute('role', 'combobox');
+    nInput.setAttribute('aria-label', 'Link a Notion page (Hostiles, NPC or PC)');
+    nInput.setAttribute('aria-autocomplete', 'list');
+    nInput.setAttribute('aria-expanded', 'false');
+    const nList = el('ul', 'combo-list');
+    nList.id = 'bst-notion-list';
+    nList.setAttribute('role', 'listbox');
+    nList.hidden = true;
+    nInput.setAttribute('aria-controls', nList.id);
+    nCombo.append(nInput, nList);
+    const nLinks = el('div', 'loc-tags');
+    const linkedName = () => findCreaturePage(current().notionId)?.name || (current().notionId ? 'Missing Notion page' : '');
+    const drawLinks = () => {
+      const page = findCreaturePage(current().notionId);
+      nLinks.replaceChildren(...(page?.tag ? [el('span', 'tag tag-muted', page.tag)] : []), ...notionLinks(page));
+      if (current().notionId) {
+        const unlink = el('button', 'btn danger', 'Unlink');
+        unlink.type = 'button';
+        unlink.addEventListener('click', () => { set(c => { c.notionId = null; }, { redraw: true }); });
+        nLinks.append(unlink);
+      }
+    };
+    nInput.value = linkedName();
+    createCombobox({
+      input: nInput,
+      list: nList,
+      getOptions(query) {
+        const q = nameKey(query);
+        const found = dm.creaturePages.filter(pg => !q || nameKey(pg.name).includes(q) || nameKey(pg.tag).includes(q));
+        return {
+          options: found.slice(0, 50).map(pg => ({ id: pg.id, label: pg.name, detail: pg.tag, detailTag: true, selected: pg.id === current().notionId })),
+          notes: dm.creaturePages.length ? (found.length ? [] : ['No matching pages.']) : ['No Notion pages tagged Hostiles, NPC or PC yet.'],
+        };
+      },
+      // Linking only sets the link. The creature's name follows the page only while you haven't typed
+      // your own (your name > Notion page > Open5e); nothing else about the creature changes.
+      onChoose(opt) { set(c => { c.notionId = opt.id; }, { redraw: true }); },
+      onClose() { nInput.value = linkedName(); },
+    });
+    nInput.addEventListener('focus', () => nInput.select());
+    drawLinks();
+    notion.append(nCombo, nLinks);
+    if (!dm.creaturePages.length) {
+      notion.append(el('p', 'bst-hint', 'No pages tagged Hostiles, NPC or PC were found in Notion.' +
+        (dm.tagsSeen.length ? ` Tags in your database: ${dm.tagsSeen.join(', ')}.` : ' Try Sync Notion.')));
+    }
+    nameGroup.append(notion);
+
+    // Party tag: "+ Add party" in the tracker adds everyone tagged
+    const partyLab = el('label', 'bst-check');
+    const partyBox = el('input');
+    partyBox.type = 'checkbox';
+    partyBox.checked = !!creature.inParty;
+    partyBox.addEventListener('change', () => set(c => { c.inParty = partyBox.checked; }, { redraw: true }));
+    partyLab.append(partyBox, document.createTextNode(' Party member (added together with + Add party)'));
+    nameGroup.append(partyLab);
+
+    // Character details (PCs and party members)
+    if (isCharacter(creature)) {
+      const ch = group('Character');
+      const chGrid = el('div', 'bst-grid');
+      chGrid.append(
+        input('Level', creature.level, v => set(c => { c.level = v === '' ? null : Math.min(20, Math.max(1, num(v) || 1)); }), { inputMode: 'numeric', placeholder: '1' }),
+        input('Class', creature.className, v => set(c => { c.className = v; }), { cls: 'span2', placeholder: 'Wizard (Divination)' }),
+        input('Player', creature.player, v => set(c => { c.player = v; }), { placeholder: 'Who plays them' }),
+        input('Passive Perception', creature.passive, v => set(c => { c.passive = num(v); }), { inputMode: 'numeric', placeholder: '10' }),
+      );
+      ch.append(chGrid);
+      mainEl.append(ch);
+    }
+
+    // Core numbers (these are what the tracker uses) and description
+    const sb = creature.statblock || {};
+    const core = group('Combat');
+    const coreGrid = el('div', 'bst-grid');
+    const initField = input('Initiative bonus', creature.initBonus === null || creature.initBonus === undefined ? '' : signed(creature.initBonus),
+      v => set(c => { c.initBonus = num(v.replace(/^\+/, '')); }), { inputMode: 'numeric' });
+    coreGrid.append(
+      input('CR', creature.cr, v => set(c => { c.cr = v; })),
+      input('AC', creature.ac, v => set(c => { c.ac = num(v); }), { inputMode: 'numeric' }),
+      input('Armor note', sb.acDesc, v => setSb(s => { s.acDesc = v; }), { cls: 'span2', placeholder: 'natural armor' }),
+      input('HP', creature.hp, v => set(c => { c.hp = num(v); }), { inputMode: 'numeric' }),
+      input('Hit dice', creature.hitDice, v => set(c => { c.hitDice = v; }), { placeholder: '2d6' }),
+      initField,
+      input('Speed', sb.speed, v => setSb(s => { s.speed = v; }), { cls: 'span2', placeholder: '30 ft., fly 60 ft.' }),
+      input('Size', sb.size, v => setSb(s => { s.size = v; }), { placeholder: 'Medium' }),
+      input('Type', sb.type, v => setSb(s => { s.type = v; }), { placeholder: 'humanoid' }),
+      input('Subtype', sb.subtype, v => setSb(s => { s.subtype = v; }), { placeholder: 'goblinoid' }),
+      input('Alignment', sb.alignment, v => setSb(s => { s.alignment = v; }), { cls: 'span2', placeholder: 'neutral evil' }),
+    );
+    core.append(coreGrid);
+    mainEl.append(core);
+
+    // Ability scores (Dex also moves the initiative bonus, unless you've set it to something else)
+    const abil = group('Ability scores');
+    const abilGrid = el('div', 'bst-abilities');
+    ['str', 'dex', 'con', 'int', 'wis', 'cha'].forEach(k => {
+      abilGrid.append(input(k.toUpperCase(), sb.abilities?.[k], (v, i) => {
+        const score = num(v);
+        set(c => {
+          c.statblock = c.statblock || {};
+          c.statblock.abilities = { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10, ...(c.statblock.abilities || {}) };
+          const oldDexMod = abilityMod(c.statblock.abilities.dex);
+          c.statblock.abilities[k] = score ?? 10;
+          if (k === 'dex' && (c.initBonus === null || c.initBonus === undefined || c.initBonus === oldDexMod)) {
+            c.initBonus = abilityMod(c.statblock.abilities.dex);
+            initField.querySelector('input').value = signed(c.initBonus);
+          }
+        });
+        i.value = score ?? 10;
+      }, { inputMode: 'numeric', placeholder: '10' }));
+    });
+    abil.append(abilGrid);
+    mainEl.append(abil);
+
+    // Details
+    const details = group('Details');
+    const detailGrid = el('div', 'bst-grid two');
+    [['Saving throws', 'saves', 'Dex +4, Wis +2'], ['Skills', 'skills', 'Stealth +6'],
+     ['Damage vulnerabilities', 'vulnerabilities', ''], ['Damage resistances', 'resistances', ''],
+     ['Damage immunities', 'immunities', ''], ['Condition immunities', 'conditionImmunities', ''],
+     ['Senses', 'senses', 'darkvision 60 ft., passive Perception 9'], ['Languages', 'languages', 'Common, Goblin'],
+    ].forEach(([label, key, ph]) => detailGrid.append(input(label, sb[key], v => setSb(s => { s[key] = v; }), { placeholder: ph })));
+    details.append(detailGrid);
+    mainEl.append(details);
+
+    // Spellcasting: ability, DC, attack bonus, and spells picked from the whole Spellbook catalog
+    const casting = group('Spellcasting');
+    const castGrid = el('div', 'bst-grid');
+    const abilLab = el('label', 'bst-field');
+    abilLab.append(el('span', 'bst-label', 'Ability'));
+    const abilSel = el('select', 'init-input');
+    [['', '—'], ['int', 'Intelligence'], ['wis', 'Wisdom'], ['cha', 'Charisma']].forEach(([v, t]) => { const o = el('option', '', t); o.value = v; abilSel.append(o); });
+    abilSel.value = creature.spellAbility || '';
+    abilSel.addEventListener('change', () => set(c => { c.spellAbility = abilSel.value; }));
+    abilLab.append(abilSel);
+    castGrid.append(abilLab,
+      input('Spell save DC', creature.spellDc, v => set(c => { c.spellDc = num(v); }), { inputMode: 'numeric', placeholder: '13' }),
+      input('Spell attack', creature.spellAttack == null ? '' : signed(creature.spellAttack), v => set(c => { c.spellAttack = num(v.replace(/^\+/, '')); }), { inputMode: 'numeric', placeholder: '+5' }));
+    casting.append(castGrid);
+
+    // Picker over every spell (Open5e + yours)
+    const pick = el('div', 'combo spl-pick');
+    const pickInput = el('input', 'combo-input init-input');
+    pickInput.type = 'text';
+    pickInput.id = 'bst-spell-pick';
+    pickInput.placeholder = 'Add a spell… (type to search every spell)';
+    pickInput.autocomplete = 'off';
+    pickInput.setAttribute('role', 'combobox');
+    pickInput.setAttribute('aria-label', 'Add a spell');
+    pickInput.setAttribute('aria-autocomplete', 'list');
+    pickInput.setAttribute('aria-expanded', 'false');
+    const pickList = el('ul', 'combo-list');
+    pickList.id = 'bst-spell-pick-list';
+    pickList.setAttribute('role', 'listbox');
+    pickList.hidden = true;
+    pickInput.setAttribute('aria-controls', pickList.id);
+    pick.append(pickInput, pickList);
+    const pickBox = createCombobox({
+      input: pickInput,
+      list: pickList,
+      getOptions(query) {
+        const words = nameKey(query).split(' ').filter(Boolean);
+        const have = new Set((current().spells || []).map(sp => spellInfo(sp.key)?.key || sp.key));
+        const found = words.length ? spellCatalog().map(s => ({ ...s, via: spellMatch(s, words).via, ok: spellMatch(s, words).ok })).filter(s => s.ok) : [];
+        found.sort((a, b) => (b.mine - a.mine) || a.level - b.level || a.name.localeCompare(b.name));
+        const notes = [];
+        if (!spellIndex.list) notes.push(spellIndex.loading ? 'Loading Open5e spells…' : 'Open5e spells not loaded yet; your own spells still show.');
+        if (!words.length) notes.push('Type a spell name.');
+        else if (!found.length) notes.push('No spells match. Add it in the Spellbook (✨) with "+ New spell".');
+        return {
+          options: found.slice(0, 40).map(s => ({
+            key: s.key, name: s.name, level: s.level, label: s.name + (have.has(s.key) ? ' ✓' : ''),
+            detail: [s.via && `aka ${s.via}`, s.level === 0 ? 'Cantrip' : `Level ${s.level}`, s.school && titleCase(s.school), s.mine ? 'Yours' : s.source].filter(Boolean).join(' · '),
+          })),
+          notes,
+        };
+      },
+      onChoose(opt) {
+        set(c => {
+          c.spells = c.spells || [];
+          if (!c.spells.some(sp => sp.key === opt.key)) c.spells.push({ key: opt.key, name: opt.name, level: opt.level, prepared: true, note: '' });
+        }, { redraw: true });
+        setTimeout(() => mainEl.querySelector('#bst-spell-pick')?.focus(), 0);
+      },
+    });
+    if (!spellIndex.list && !spellIndex.loading) spellIndex.load().then(() => pickBox.refresh()).catch(() => {});
+    casting.append(pick);
+
+    // The creature's spells: open, prepared, note, remove
+    const spellRows = el('div', 'spl-pick-rows');
+    const spells = [...(creature.spells || [])].map(sp => ({ ...sp, info: spellInfo(sp.key) }))
+      .sort((a, b) => (a.info?.level ?? a.level) - (b.info?.level ?? b.level) || (a.info?.name || a.name).localeCompare(b.info?.name || b.name));
+    // Point one spell at a different Spellbook spell (Open5e, another source, or your own)
+    const relink = (row, sp) => {
+      const box = el('div', 'combo spl-relink');
+      const inp = el('input', 'combo-input init-input');
+      inp.type = 'text'; inp.value = sp.name; inp.autocomplete = 'off';
+      inp.id = `bst-relink-${sp.key.replace(/[^\w-]/g, '')}`;
+      inp.setAttribute('role', 'combobox'); inp.setAttribute('aria-label', `Link ${sp.name} to a spell`);
+      inp.setAttribute('aria-autocomplete', 'list'); inp.setAttribute('aria-expanded', 'false');
+      const lst = el('ul', 'combo-list'); lst.id = `${inp.id}-list`; lst.setAttribute('role', 'listbox'); lst.hidden = true;
+      inp.setAttribute('aria-controls', lst.id);
+      box.append(inp, lst);
+      const cancel = el('button', 'btn', 'Cancel'); cancel.type = 'button';
+      cancel.addEventListener('click', () => renderEditor());
+      row.replaceChildren(box, cancel);
+      row.classList.add('is-relinking');
+      const relinkBox = createCombobox({
+        input: inp, list: lst,
+        getOptions(query) {
+          const words = nameKey(query || inp.value).split(' ').filter(Boolean);   // starts with the spell's own name
+          const found = spellCatalog().map(s => ({ ...s, ...spellMatch(s, words) })).filter(s => s.ok)
+            .sort((a, b) => (b.mine - a.mine) || a.level - b.level || a.name.localeCompare(b.name));
+          return {
+            options: found.slice(0, 40).map(s => ({ key: s.key, name: s.name, level: s.level, label: s.name,
+              detail: [s.via && `aka ${s.via}`, s.level === 0 ? 'Cantrip' : `Level ${s.level}`, s.mine ? 'Yours' : s.source].filter(Boolean).join(' · ') })),
+            notes: found.length ? [] : ['No spells match. Use Create to add it to your Spellbook.'],
+          };
+        },
+        onChoose(opt) {
+          set(c => {
+            const t = c.spells.find(x => x.key === sp.key);
+            if (!t) return;
+            if (c.spells.some(x => x.key === opt.key && x !== t)) { c.spells = c.spells.filter(x => x !== t); return; }
+            Object.assign(t, { key: opt.key, name: opt.name, level: opt.level });
+          }, { redraw: true });
+        },
+      });
+      inp.focus(); inp.select();
+      relinkBox.open();   // show matches for the current name straight away
+    };
+
+    // Not in your Spellbook: start a spell there with the name and level filled in, and link to it
+    const createFor = sp => {
+      const id = newId();
+      dm.update(d => {
+        d.spells.push({ id, name: sp.name, level: sp.level ?? 0, school: '', castingTime: '1 action', range: '', components: '', material: '',
+          duration: '', concentration: false, ritual: false, classes: '', desc: '', higherLevel: '', book: '', notes: '', source: null });
+        const c = d.bestiary.find(x => x.id === creature.id);
+        const t = c?.spells.find(x => x.key === sp.key);
+        if (t) t.key = `c:${id}`;
+      });
+      renderEditor();
+      openSpellbook(`c:${id}`, { edit: true });
+    };
+
+    spells.forEach(sp => {
+      const row = el('div', `spl-pick-row${sp.key.startsWith('u:') ? ' is-unlinked' : ''}`);
+      if (sp.key.startsWith('u:')) {
+        const name = el('span', 'spl-pick-open spl-unlinked-name', sp.name);
+        name.title = 'Not linked to a spell in your Spellbook';
+        const lvl = el('span', 'spl-pick-level', (sp.level ?? 0) === 0 ? 'Cantrip' : `L${sp.level}`);
+        const actions = el('span', 'spl-link-actions');
+        const linkBtn = el('button', 'btn', 'Link…'); linkBtn.type = 'button';
+        linkBtn.addEventListener('click', () => relink(row, sp));
+        const createBtn = el('button', 'btn', 'Create'); createBtn.type = 'button';
+        createBtn.title = 'Add it to your Spellbook (name and level filled in) and link it';
+        createBtn.addEventListener('click', () => createFor(sp));
+        actions.append(el('span', 'spl-unlinked-tag', 'not linked'), linkBtn, createBtn);
+        const rmU = el('button', 'icon-btn danger', '×'); rmU.type = 'button';
+        rmU.setAttribute('aria-label', `Remove ${sp.name}`);
+        rmU.addEventListener('click', () => set(c => { c.spells = c.spells.filter(x => x.key !== sp.key); }, { redraw: true }));
+        row.append(name, lvl, actions, rmU);
+        spellRows.append(row);
+        return;
+      }
+      const open = el('button', 'spl-pick-open', sp.info?.name || sp.name);
+      open.type = 'button';
+      open.title = 'Open the spell card';
+      open.addEventListener('click', () => openSpellCard(sp.key));
+      const relinkBtn = el('button', 'icon-btn spl-relink-btn', '🔗');
+      relinkBtn.type = 'button';
+      relinkBtn.title = 'Link to a different spell (another source, or your own version)';
+      relinkBtn.setAttribute('aria-label', `Link ${sp.name} to a different spell`);
+      relinkBtn.addEventListener('click', () => relink(row, sp));
+      const lvl = el('span', 'spl-pick-level', (sp.info?.level ?? sp.level) === 0 ? 'Cantrip' : `L${sp.info?.level ?? sp.level}`);
+      const prep = el('label', 'bst-check spl-prep');
+      const box = el('input'); box.type = 'checkbox'; box.checked = !!sp.prepared;
+      box.setAttribute('aria-label', `${sp.name} prepared`);
+      box.addEventListener('change', () => set(c => { const t = c.spells.find(x => x.key === sp.key); if (t) t.prepared = box.checked; }));
+      prep.append(box, document.createTextNode(' Prepared'));
+      const note = el('input', 'init-input spl-note');
+      note.type = 'text'; note.value = sp.note || ''; note.placeholder = 'at will, 1/day…';
+      note.setAttribute('aria-label', `Note for ${sp.name}`);
+      note.addEventListener('change', () => set(c => { const t = c.spells.find(x => x.key === sp.key); if (t) t.note = note.value.trim(); }));
+      const rm = el('button', 'icon-btn danger', '×');
+      rm.type = 'button';
+      rm.setAttribute('aria-label', `Remove ${sp.name}`);
+      rm.addEventListener('click', () => set(c => { c.spells = c.spells.filter(x => x.key !== sp.key); }, { redraw: true }));
+      row.append(open, lvl, prep, note, relinkBtn, rm);
+      spellRows.append(row);
+    });
+    if (!spells.length) spellRows.append(el('p', 'enc-hint', 'No spells yet. Leave this empty for creatures that don\'t cast.'));
+    const unlinked = spells.filter(sp => sp.key.startsWith('u:')).length;
+    if (unlinked) spellRows.prepend(el('p', 'bst-hint', `${unlinked} spell${unlinked === 1 ? ' isn\'t' : 's aren\'t'} in your Spellbook yet. Link each to a spell, or Create it.`));
+    // Read the stat block's Spellcasting trait (for creatures imported before this existed, or to start over)
+    if (parseSpellcasting(creature.statblock)) {
+      const importBtn = el('button', 'btn', creature.spells?.length ? 'Re-import spells from stat block' : 'Import spells from stat block');
+      importBtn.type = 'button';
+      importBtn.title = "Read the stat block's Spellcasting trait and link each spell to your Spellbook";
+      importBtn.addEventListener('click', async () => {
+        if (creature.spells?.length && !confirm('Replace this creature\'s spell list with the one from its stat block? Links you changed by hand will be redone.')) return;
+        importBtn.disabled = true; importBtn.textContent = 'Linking spells…';
+        await importSpellsFromStatblock(creature.id);
+        renderEditor();
+      });
+      spellRows.append(importBtn);
+    }
+    casting.append(spellRows);
+    mainEl.append(casting);
+
+    // Sections like Open5e's: Traits, Actions, Bonus actions, Reactions, Legendary actions
+    [['traits', 'Traits', 'trait'], ['actions', 'Actions', 'action'], ['bonusActions', 'Bonus actions', 'bonus action'],
+     ['reactions', 'Reactions', 'reaction'], ['legendaryActions', 'Legendary actions', 'legendary action']].forEach(([key, title, noun]) => {
+      const sec = group(title);
+      if (key === 'legendaryActions') {
+        const lab = el('label', 'bst-field wide');
+        lab.append(el('span', 'bst-label', 'Intro'));
+        const intro = el('textarea', 'init-notes bst-desc');
+        intro.rows = 2;
+        intro.placeholder = 'The creature can take 3 legendary actions…';
+        intro.value = sb.legendaryDesc || '';
+        intro.addEventListener('change', () => setSb(s => { s.legendaryDesc = intro.value; }));
+        lab.append(intro);
+        sec.append(lab);
+      }
+      const items = sb[key] || [];
+      items.forEach((it, i) => {
+        const card = el('div', 'bst-entry');
+        const nameIn = el('input', 'init-input bst-entry-name');
+        nameIn.type = 'text';
+        nameIn.value = it.name || '';
+        nameIn.placeholder = `${noun[0].toUpperCase()}${noun.slice(1)} name`;
+        nameIn.setAttribute('aria-label', `${title} ${i + 1} name`);
+        nameIn.addEventListener('change', () => setSb(s => { s[key][i].name = nameIn.value.trim(); }));
+        const tools = el('span', 'bst-entry-tools');
+        const mk = (text, label, fn, extra = '') => { const b = el('button', `icon-btn ${extra}`, text); b.type = 'button'; b.setAttribute('aria-label', label); b.title = label; b.addEventListener('click', fn); return b; };
+        const move = dir => set(c => { const arr = c.statblock[key]; const [x] = arr.splice(i, 1); arr.splice(i + dir, 0, x); }, { redraw: true });
+        const up = mk('↑', 'Move up', () => move(-1)); up.disabled = i === 0;
+        const down = mk('↓', 'Move down', () => move(1)); down.disabled = i === items.length - 1;
+        tools.append(up, down, mk('×', `Remove ${it.name || noun}`, () => set(c => { c.statblock[key].splice(i, 1); }, { redraw: true }), 'danger'));
+        const descIn = el('textarea', 'init-notes bst-desc');
+        descIn.rows = 2;
+        descIn.value = it.desc || '';
+        descIn.placeholder = 'Melee Weapon Attack: +4 to hit, reach 5 ft., one target. Hit: 5 (1d6 + 2) slashing damage.';
+        descIn.setAttribute('aria-label', `${title} ${i + 1} description`);
+        descIn.addEventListener('change', () => setSb(s => { s[key][i].desc = descIn.value; }));
+        const headRow = el('div', 'bst-entry-head');
+        headRow.append(nameIn, tools);
+        card.append(headRow, descIn);
+        sec.append(card);
+      });
+      const add = el('button', 'btn', `+ Add ${noun}`);
+      add.type = 'button';
+      add.addEventListener('click', () => {
+        set(c => { c.statblock = c.statblock || {}; (c.statblock[key] = c.statblock[key] || []).push({ name: '', desc: '' }); }, { redraw: true });
+        const cards = mainEl.querySelectorAll(`.bst-group[data-key="${key}"] .bst-entry-name`);
+        cards[cards.length - 1]?.focus();
+      });
+      sec.dataset.key = key;
+      sec.append(add);
+      mainEl.append(sec);
+    });
+
+    // Notes
+    const notesGroup = group('Your notes');
+    const notes = el('textarea', 'init-notes bst-notes');
+    notes.rows = 4;
+    notes.placeholder = 'Tactics, reminders, changes from the book…';
+    notes.value = creature.notes || '';
+    notes.addEventListener('change', () => set(c => { c.notes = notes.value; }));
+    notesGroup.append(notes);
+    mainEl.append(notesGroup);
+
+    const bottom = el('div', 'bst-actions');
+    const del = el('button', 'btn danger', 'Delete creature');
+    del.type = 'button';
+    del.addEventListener('click', () => {
+      if (!confirm(`Delete "${creatureName(creature)}" from your bestiary? Combatants already in initiative keep their numbers.`)) return;
+      dm.update(d => { d.bestiary = d.bestiary.filter(c => c.id !== creature.id); });
+      select(null);
+    });
+    bottom.append(del);
+    mainEl.append(bottom);
+
+    // Live preview of the finished stat block
+    const previewGroup = group('Preview');
+    const preview = el('div', 'statblock-holder bst-block');
+    previewGroup.append(preview);
+    mainEl.append(previewGroup);
+    function drawPreview() { preview.replaceChildren(renderCreatureBlock(current())); }
+    drawPreview();
+    mainEl.scrollTop = keepScroll;
+  }
+
+  // New homebrew creature
+  $('[data-new]').addEventListener('click', () => {
+    const id = newId();
+    dm.update(d => { d.bestiary.push({ id, name: 'Unnamed creature', nameOverride: '', cr: '', xp: null, ac: null, hp: null, hitDice: '', initBonus: null, notes: '', notionId: null, source: null, statblock: null }); });
+    select(id, { edit: true });
+    mainEl.scrollTop = 0;
+    mainEl.querySelector('.bst-field input')?.focus();
+  });
+
+  // Filter
+  $('.bst-filter').addEventListener('input', e => { filter = e.target.value; renderList(); });
+
+  // Open5e search panel: a third column with full results. Choosing one fills the
+  // selected creature's stats (notes and Notion link are kept). Clicking the left two
+  // columns, or ✕, closes it without choosing. Searches are reads only.
+  const bodyEl = $('.bst-body'), panel = $('.bst-o5e');
+  // Spell cards open in the right-hand column while the Bestiary is open
+  const spellCol = $('.bst-spellcol'), spellBody = $('.bst-spellcol-body');
+  const closeSpellCol = () => { if (spellCol.hidden) return; spellCol.hidden = true; if (panel.hidden) bodyEl.classList.remove('has-search'); };
+  spellCardTarget = key => {
+    panel.hidden = true;
+    spellCol.hidden = false;
+    bodyEl.classList.add('has-search');
+    spellBody.replaceChildren(el('p', 'bst-search-status', 'Loading…'));
+    spellDetailFor(key)
+      .then(s => spellBody.replaceChildren(s ? renderSpellCard(s) : el('p', '', 'That spell is no longer in your Spellbook.')))
+      .catch(err => spellBody.replaceChildren(el('p', '', `Couldn't load the spell (${err.message}).`)));
+  };
+  $('[data-spell-close]').addEventListener('click', closeSpellCol);
+  dialog.addEventListener('close', () => { spellCardTarget = null; });
+  const searchInput = $('#bst-search-input'), statusEl = $('.bst-search-status'), resultsEl = $('.bst-results');
+  let searchTimer = null, searchSeq = 0;
+
+  function openSearch(initial = '') {
+    closeSpellCol();
+    panel.hidden = false;
+    bodyEl.classList.add('has-search');
+    searchInput.value = initial;
+    searchInput.focus();
+    searchInput.select();
+    runSearch();
+  }
+  function closeSearch() {
+    if (panel.hidden) return;
+    panel.hidden = true;
+    bodyEl.classList.remove('has-search');
+  }
+  $('[data-search-close]').addEventListener('click', closeSearch);
+  // Clicking the list or editor closes the panel (the Search button itself just reopens it)
+  // Close the right-hand column after a click completes, not on mouse-down: closing it widens the middle
+  // column, and doing that mid-click would slide the button out from under the pointer and lose the click
+  [$('.bst-side'), mainEl].forEach(col => col.addEventListener('click', e => {
+    if (e.target.closest('.spell-chip, .spl-pick-open')) return;   // switching spells keeps the column open
+    if (!e.target.closest('[data-open-search]')) closeSearch();
+    closeSpellCol();
+  }));
+  searchInput.addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSearch(); } });
+
+  const resultButton = r => {
+    const li = el('li');
+    const b = el('button', 'bst-result');
+    b.type = 'button';
+    b.append(el('span', 'bst-result-name', r.name));
+    const meta = [[r.size, r.type && r.type.toLowerCase()].filter(Boolean).join(' '), r.cr && `CR ${r.cr}`,
+      r.ac != null && `AC ${r.ac}`, r.hp != null && `HP ${r.hp}`].filter(Boolean).join(' · ');
+    b.append(el('span', 'bst-result-meta', meta), el('span', 'bst-result-source', r.source || ''));
+    b.addEventListener('click', () => previewCreature({
+      title: r.name,
+      load: async () => renderStatBlock(await bestiaryClient.creature(r.slug)),
+      onApply: () => chooseResult(r, { confirmed: true }),
+      merge: () => mergeSourceFromOpen5e(r.slug),
+    }));
+    li.append(b);
+    return li;
+  };
+
+  // Loads one page of results; Load more fetches the next. Broad searches ("dragon") page through everything.
+  async function loadPage(term, page, seq, note = statusEl) {
+    const presetMatched = !!resultsEl.querySelector('.bst-result.is-preset');
+    const more = resultsEl.querySelector('.bst-more');
+    if (more) { more.disabled = true; more.textContent = 'Loading…'; }
+    try {
+      const res = await bestiaryClient.search(term, page);
+      if (seq !== searchSeq) return;
+      more?.parentElement.remove();
+      (res.results || []).forEach(r => resultsEl.append(resultButton(r)));
+      const shown = resultsEl.querySelectorAll('.bst-result:not(.is-preset)').length;
+      note.textContent = res.fuzzy
+        ? `No exact matches for "${term}". Close matches:`
+        : shown ? `${shown} result${shown === 1 ? '' : 's'}${res.hasMore ? ' so far' : ''}` : (res.hasMore ? 'Nothing on this page yet…' : `No matches on Open5e for "${term}".`);
+      if (res.hasMore) {
+        const li = el('li');
+        const b = el('button', 'btn bst-more', 'Load more results');
+        b.type = 'button';
+        b.addEventListener('click', () => loadPage(term, page + 1, seq, note));
+        li.append(b);
+        resultsEl.append(li);
+        // A page can be all description matches (no name matches); keep going automatically
+        if (!res.results?.length) loadPage(term, page + 1, seq, note);
+      }
+      if (!res.hasMore && !shown && !presetMatched) note.textContent += ' It may not be openly licensed; you can create it as homebrew (and save it as a preset).';
+    } catch (err) {
+      if (seq === searchSeq) note.textContent = `Search failed (${err.message}).`;
+    }
+  }
+
+  // Your presets, shown above Open5e results. Each can be deleted with ×.
+  const presetButton = preset => {
+    const li = el('li', 'bst-preset-row');
+    const b = el('button', 'bst-result is-preset');
+    b.type = 'button';
+    b.append(el('span', 'bst-result-name', preset.name));
+    const sb = preset.statblock || {};
+    const meta = [[sb.size, sb.type && sb.type.toLowerCase()].filter(Boolean).join(' '), preset.cr && `CR ${preset.cr}`,
+      preset.ac != null && `AC ${preset.ac}`, preset.hp != null && `HP ${preset.hp}`].filter(Boolean).join(' · ');
+    b.append(el('span', 'bst-result-meta', meta), el('span', 'bst-result-source', 'Your preset'));
+    b.addEventListener('click', () => previewCreature({
+      title: preset.name,
+      load: async () => renderCreatureBlock({ ...preset, nameOverride: preset.name }),
+      onApply: () => choosePreset(preset, { confirmed: true }),
+      merge: () => mergeSourceFromCreature(preset),
+    }));
+    const del = el('button', 'icon-btn danger bst-preset-del', '×');
+    del.type = 'button';
+    del.setAttribute('aria-label', `Delete the ${preset.name} preset`);
+    del.title = 'Delete this preset';
+    del.addEventListener('click', () => {
+      if (!confirm(`Delete the "${preset.name}" preset? Creatures already filled from it keep their stats.`)) return;
+      dm.update(d => { d.presets = d.presets.filter(p => p.id !== preset.id); }, { quiet: true });
+      runSearch();
+    });
+    li.append(b, del);
+    return li;
+  };
+
+  function runSearch() {
+    clearTimeout(searchTimer);
+    const term = searchInput.value.trim();
+    resultsEl.replaceChildren();
+    const seq = ++searchSeq;
+    const words = nameKey(term).split(' ').filter(Boolean);
+    const presets = dm.data.presets
+      .filter(p => words.every(w => nameKey(p.name).includes(w)))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (presets.length) {
+      resultsEl.append(el('li', 'bst-results-head', `Your presets (${presets.length})`));
+      presets.forEach(p => resultsEl.append(presetButton(p)));
+    }
+    // Your other creatures, to merge from (e.g. an Aarakocra's fly speed and Talon onto a mage)
+    const mine = dm.data.bestiary
+      .filter(c => c.id !== selected && words.every(w => nameKey(creatureName(c)).includes(w)))
+      .sort((a, b) => creatureName(a).localeCompare(creatureName(b)));
+    if (mine.length && words.length) {
+      resultsEl.append(el('li', 'bst-results-head', `Your creatures (${mine.length}) · merge`));
+      mine.slice(0, 20).forEach(c => {
+        const li = el('li');
+        const b = el('button', 'bst-result is-creature');
+        b.type = 'button';
+        b.append(el('span', 'bst-result-name', creatureName(c)));
+        const sb = c.statblock || {};
+        b.append(el('span', 'bst-result-meta', [[sb.size, sb.type && sb.type.toLowerCase()].filter(Boolean).join(' '), c.cr && `CR ${c.cr}`,
+          c.ac != null && `AC ${c.ac}`, c.hp != null && `HP ${c.hp}`].filter(Boolean).join(' · ')), el('span', 'bst-result-source', 'In your Bestiary · merge only'));
+        b.addEventListener('click', () => previewCreature({
+          title: creatureName(c),
+          load: async () => renderCreatureBlock(c),
+          merge: () => mergeSourceFromCreature(findCreature(c.id) || c),
+        }));
+        li.append(b);
+        resultsEl.append(li);
+      });
+    }
+    if (term.length < 2) {
+      statusEl.textContent = dm.data.presets.length
+        ? 'Type to search Open5e too. Several words narrow it down ("red wyrmling").'
+        : 'Type at least 2 letters. Several words narrow it down ("red wyrmling").';
+      return;
+    }
+    resultsEl.append(el('li', 'bst-results-head', 'Open5e'));
+    const note = el('li', 'bst-results-note', 'Searching…');
+    resultsEl.append(note);
+    statusEl.textContent = '';
+    searchTimer = setTimeout(() => loadPage(term, 1, seq, note), 300);
+  }
+
+  // Preview a preset or Open5e creature as a card before applying it. Cancel, Escape or clicking
+  // outside closes it and leaves the Bestiary as it was. Spells inside open their own card on top.
+  function previewCreature({ title, load, onApply, merge }) {
+    const target = findCreature(selected);
+    if (!target) return;
+    const pv = document.createElement('dialog');
+    pv.className = 'creature-preview';
+    pv.setAttribute('aria-label', `Preview: ${title}`);
+    const body = el('div', 'cp-body');
+    const holder = el('div', 'statblock-holder bst-block', 'Loading…');
+    body.append(holder);
+    const foot = el('footer', 'cp-foot');
+    const replacing = target.statblock || target.ac != null || target.hp != null;
+    foot.append(el('span', 'cp-note', replacing
+      ? `Replaces ${creatureName(target)}'s stats. Name override, notes and Notion link stay.`
+      : `Fills in ${creatureName(target)}.`));
+    const cancel = el('button', 'btn', 'Cancel');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => pv.close());
+    const apply = el('button', 'btn primary', `Apply to ${creatureName(target)}`);
+    apply.type = 'button';
+    apply.disabled = true;
+    apply.addEventListener('click', () => { pv.close(); onApply(); });
+    const mergeBtn = el('button', 'btn', 'Merge…');
+    mergeBtn.type = 'button';
+    mergeBtn.title = `Pick parts of ${title} (speeds, actions, traits, spells…) to add to ${creatureName(target)}`;
+    mergeBtn.disabled = true;
+    mergeBtn.addEventListener('click', () => showMerge());
+    foot.append(cancel, ...(merge ? [mergeBtn] : []), ...(onApply ? [apply] : []));
+    if (!onApply) foot.querySelector('.cp-note').textContent = `Merge picks parts of ${title} to add to ${creatureName(target)}.`;
+    pv.append(body, foot);
+
+    // Merge mode: a checklist of everything the source has, grouped like a stat block
+    async function showMerge() {
+      mergeBtn.disabled = true;
+      let src;
+      try { src = await merge(); } catch (err) { holder.textContent = `Couldn't load ${title} (${err.message}).`; return; }
+      const items = buildMergeItems(findCreature(target.id) || target, src);
+      const list = el('div', 'merge-list');
+      list.append(el('p', 'merge-intro', `Tick what ${creatureName(target)} should get from ${title}. Its AC, HP, CR, name, notes and Notion link stay as they are.`));
+      if (!items.length) list.append(el('p', 'bst-empty', `${title} has nothing ${creatureName(target)} doesn't already have.`));
+      const ORDER = ['Movement & senses', 'Skills & languages', 'Defenses', 'Size & type', 'Traits', 'Actions', 'Bonus actions', 'Reactions', 'Legendary actions', 'Spellcasting'];
+      const boxes = [];
+      ORDER.forEach(group => {
+        const groupItems = items.filter(it => it.group === group);
+        if (!groupItems.length) return;
+        const fs = el('fieldset', 'bst-group merge-group');
+        fs.append(el('legend', '', group));
+        groupItems.forEach(it => {
+          const lab = el('label', `merge-item${it.disabled ? ' is-disabled' : ''}`);
+          const box = el('input'); box.type = 'checkbox'; box.disabled = !!it.disabled;
+          box.addEventListener('change', updateCount);
+          if (!it.disabled) boxes.push({ box, it });
+          const text = el('span', 'merge-text');
+          text.append(el('strong', '', it.label));
+          if (it.detail) text.append(el('span', 'merge-detail', it.detail));
+          lab.append(box, text);
+          fs.append(lab);
+        });
+        list.append(fs);
+      });
+      holder.replaceChildren(list);
+      holder.classList.add('is-merging');
+      // Footer becomes: Back · Cancel · Merge selected
+      const back = el('button', 'btn', '← Back'); back.type = 'button';
+      back.addEventListener('click', () => { pv.close(); previewCreature({ title, load, onApply, merge }); });
+      const go = el('button', 'btn primary', 'Merge selected'); go.type = 'button'; go.disabled = true;
+      go.addEventListener('click', async () => {
+        const chosen = boxes.filter(b => b.box.checked).map(b => b.it);
+        if (!chosen.length) return;
+        // The target's own spells may only be written in its Spellcasting trait: link them first,
+        // otherwise adding a spell would hide that text and its spells would disappear from the stat block
+        const current = findCreature(target.id);
+        let own = null;
+        if (chosen.some(it => it.group === 'Spellcasting') && !current?.spells?.length && parseSpellcasting(current?.statblock)) {
+          go.disabled = true; go.textContent = 'Linking its own spells…';
+          own = await spellsFromStatblock(current.statblock);
+        }
+        dm.update(d => {
+          const c = d.bestiary.find(x => x.id === target.id);
+          if (!c) return;
+          c.statblock = c.statblock || {};
+          if (own) {
+            c.spells = own.spells;
+            if (own.ability && !c.spellAbility) c.spellAbility = own.ability;
+            if (own.dc != null && c.spellDc == null) c.spellDc = own.dc;
+            if (own.attack != null && c.spellAttack == null) c.spellAttack = own.attack;
+          }
+          chosen.forEach(it => it.apply(c));
+          c.name = creatureName(c);
+        });
+        pv.close();
+        renderList();
+        renderEditor();
+      });
+      const note = foot.querySelector('.cp-note');
+      foot.replaceChildren(note, back, cancel, go);
+      function updateCount() {
+        const n = boxes.filter(b => b.box.checked).length;
+        go.disabled = !n;
+        go.textContent = n ? `Merge ${n} into ${creatureName(target)}` : 'Merge selected';
+        note.textContent = n ? `${n} selected` : 'Nothing selected yet';
+      }
+      updateCount();
+    }
+    // While previewing, spell names open a popup on top instead of the Bestiary's (hidden) right column
+    const keepTarget = spellCardTarget;
+    spellCardTarget = null;
+    pv.addEventListener('click', e => { if (e.target === pv) pv.close(); });
+    pv.addEventListener('close', () => { spellCardTarget = keepTarget; pv.remove(); });
+    document.body.append(pv);
+    pv.showModal();
+    apply.focus();
+    load()
+      .then(block => { holder.replaceChildren(block); apply.disabled = false; mergeBtn.disabled = false; })
+      .catch(err => { holder.textContent = `Couldn't load ${title} (${err.message}).`; });
+  }
+
+  function choosePreset(preset, { confirmed = false } = {}) {
+    const creature = findCreature(selected);
+    if (!creature) return;
+    const hasStats = creature.statblock || creature.ac != null || creature.hp != null;
+    if (hasStats && !confirmed && !confirm(`Replace ${creatureName(creature)}'s stats with the "${preset.name}" preset? Your notes and Notion link stay.`)) return;
+    dm.update(d => {
+      const c = d.bestiary.find(x => x.id === creature.id);
+      if (c) { applyPreset(c, preset); c.name = creatureName(c); }
+    });
+    closeSearch();
+    renderEditor();
+  }
+  searchInput.addEventListener('input', runSearch);
+
+  async function chooseResult(r, { confirmed = false } = {}) {
+    const creature = findCreature(selected);
+    if (!creature) return;
+    const hasStats = creature.statblock || creature.ac != null || creature.hp != null;
+    if (hasStats && !confirmed && !confirm(`Replace ${creature.name}'s stats with ${r.name} from Open5e? Your notes and Notion link stay.`)) return;
+    statusEl.textContent = `Loading ${r.name}…`;
+    try {
+      const sb = await bestiaryClient.creature(r.slug);
+      dm.update(d => {
+        const c = d.bestiary.find(x => x.id === creature.id);
+        if (c) Object.assign(c, {
+          cr: sb.cr, xp: sb.xp, ac: sb.ac, hp: sb.hp, hitDice: sb.hitDice,
+          initBonus: abilityMod(sb.abilities?.dex), source: { type: 'open5e', slug: r.slug }, statblock: structuredClone(sb),
+        });
+        if (c) c.name = creatureName(c);
+      });
+      closeSearch();
+      renderEditor();
+      // Link its spells to the Spellbook
+      if (parseSpellcasting(sb)) importSpellsFromStatblock(creature.id).then(() => renderEditor());
+    } catch (err) {
+      statusEl.textContent = `Couldn't load ${r.name} (${err.message}).`;
+    }
+  }
+
+  // Refresh the Hostiles / NPC / PC list from Notion (a read; only writes if Notion changed)
+  const syncBtn = $('[data-sync]');
+  syncBtn.addEventListener('click', async () => {
+    syncBtn.disabled = true;
+    syncBtn.textContent = 'Syncing…';
+    try {
+      const res = await editorApi('/sync', { method: 'POST' });
+      dm.setCreaturePages(res.creaturePages, res.tagsSeen);
+      syncBtn.textContent = `${(res.creaturePages || []).length} linkable pages`;
+      renderEditor();
+    } catch (err) {
+      syncBtn.textContent = 'Sync failed';
+    }
+    setTimeout(() => { syncBtn.textContent = 'Sync Notion'; syncBtn.disabled = false; }, 1800);
+  });
+
+  renderList();
+  renderEditor();
+  dialog.showModal();
+}
+
+/* ---- Spell cards ---- */
+const SPELL_SCHOOLS = ['Abjuration', 'Conjuration', 'Divination', 'Enchantment', 'Evocation', 'Illusion', 'Necromancy', 'Transmutation'];
+const ordinal = n => `${n}${n === 1 ? 'st' : n === 2 ? 'nd' : n === 3 ? 'rd' : 'th'}`;
+const titleCase = s => String(s || '').replace(/\b\w/g, ch => ch.toUpperCase());
+const spellLevelText = s => {
+  const school = titleCase(s.school);
+  const base = s.level === 0 ? `${school || 'Spell'} cantrip` : `${ordinal(s.level)}-level ${school.toLowerCase() || 'spell'}`;
+  return `${base}${s.ritual ? ' (ritual)' : ''}`;
+};
+const spellLevelShort = level => (level === 0 ? 'Cantrip' : `Level ${level}`);
+
+// A card in the style of printed spell cards: banner, four stats, text, higher levels, footer
+function renderSpellCard(s) {
+  const card = el('article', `spell-card school-${(s.school || 'none').toLowerCase()}`);
+  const head = el('header', 'sc-head');
+  head.append(el('h3', 'sc-name', s.name || 'Unnamed spell'), el('div', 'sc-type', spellLevelText(s)));
+  if (s.aliases?.length) head.append(el('div', 'sc-aka', `Also known as ${s.aliases.join(', ')}`));
+  card.append(head);
+  const stats = el('div', 'sc-stats');
+  [['Casting time', s.castingTime], ['Range', s.range], ['Components', s.components],
+   ['Duration', `${s.concentration ? 'Concentration, ' : ''}${s.duration || ''}`.replace(/^Concentration, $/, 'Concentration')]]
+    .forEach(([k, v]) => { const cell = el('div', 'sc-stat'); cell.append(el('span', 'sc-k', k), el('span', 'sc-v', v || '—')); stats.append(cell); });
+  card.append(stats);
+  const flags = [s.concentration && 'Concentration', s.ritual && 'Ritual'].filter(Boolean);
+  if (flags.length) { const f = el('div', 'sc-flags'); flags.forEach(t => f.append(el('span', 'tag', t))); card.append(f); }
+  if (s.material) card.append(el('p', 'sc-material', `Material: ${s.material}`));
+  card.append(el('div', 'sc-desc', plainDesc(s.desc) || 'No description yet.'));
+  if (s.higherLevel) {
+    const hl = el('div', 'sc-higher');
+    hl.append(el('strong', '', s.level === 0 ? 'Cantrip upgrade. ' : 'At higher levels. '), document.createTextNode(plainDesc(s.higherLevel)));
+    card.append(hl);
+  }
+  if (s.notes) { const n = el('div', 'sc-notes'); n.append(el('strong', '', 'Your notes. '), document.createTextNode(s.notes)); card.append(n); }
+  const foot = el('footer', 'sc-foot');
+  foot.append(el('span', '', s.classes || ''), el('span', '', s.book || (s.source?.type === 'open5e' ? 'Open5e' : '')));
+  card.append(foot);
+  return card;
+}
+
+/* ---- Spell catalog: every Open5e spell (cached index) plus your own ----
+   The index is slim (name, level, school, classes, source), walked page by page once and kept in
+   this browser for two weeks. Full spell text is fetched when a card opens. */
+const SPELL_INDEX_KEY = 'dnd-map:spell-index';
+const spellIndex = (() => {
+  let list = null, loading = null, progress = { loaded: 0, total: null };
+  const listeners = new Set();
+  try {
+    const cached = JSON.parse(localStorage.getItem(SPELL_INDEX_KEY) || 'null');
+    if (cached?.list?.length && Date.now() - cached.savedAt < 14 * 864e5) list = cached.list;
+  } catch { /* no cache */ }
+  function load(force = false) {
+    if (list && !force) return Promise.resolve(list);
+    if (loading) return loading;
+    loading = (async () => {
+      const out = [];
+      for (let page = 1, more = true; more && page <= 60; page++) {
+        const res = await editorApi(`/bestiary/spell-index?page=${page}`);
+        out.push(...(res.results || []));
+        progress = { loaded: out.length, total: res.count };
+        listeners.forEach(fn => fn(progress));
+        more = res.hasMore;
+      }
+      list = out;
+      try { localStorage.setItem(SPELL_INDEX_KEY, JSON.stringify({ savedAt: Date.now(), list })); } catch { /* storage full: keep in memory */ }
+      listeners.forEach(fn => fn(progress));
+      return list;
+    })().finally(() => { loading = null; });
+    return loading;
+  }
+  return {
+    load,
+    get list() { return list; },
+    get loading() { return !!loading; },
+    get progress() { return progress; },
+    onChange(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+  };
+})();
+
+const findSpell = id => dm.data.spells.find(s => s.id === id);
+// Other names: stored per key; a customized copy also picks up the names given to its Open5e original
+const splitNames = v => String(v || '').split(',').map(n => n.trim()).filter(Boolean);
+const aliasesFor = (key, slug) => [...new Set([...splitNames(dm.data.spellAliases?.[key]), ...(slug ? splitNames(dm.data.spellAliases?.[`o:${slug}`]) : [])])];
+// "Player's Handbook p. 247" -> "Player's Handbook" (for the source menu)
+const bookName = book => String(book || '').replace(/[\s,]*(?:p\.?|pg\.?|page|pp\.?)\s*\d.*$/i, '').replace(/[\s,]+\d+\s*$/, '').trim();
+// Match a spell by its name or any other name; returns the other name that matched (or '' for the real name)
+function spellMatch(s, words) {
+  if (!words.length) return { ok: true, via: '' };
+  if (words.every(w => nameKey(s.name).includes(w))) return { ok: true, via: '' };
+  const via = (s.aliases || []).find(a => words.every(w => nameKey(a).includes(w)));
+  return via ? { ok: true, via } : { ok: false, via: '' };
+}
+const copyOf = slug => dm.data.spells.find(s => s.source?.type === 'open5e' && s.source.slug === slug);
+// Everything you can pick or browse: your spells first (customized copies replace the Open5e original)
+function spellCatalog() {
+  const mine = dm.data.spells.map(s => ({
+    key: `c:${s.id}`, id: s.id, name: s.name, level: s.level ?? 0, school: s.school, classes: s.classes,
+    concentration: s.concentration, ritual: s.ritual, castingTime: s.castingTime, mine: true, slug: s.source?.slug,
+    book: bookName(s.book),
+    source: bookName(s.book) || (s.source?.type === 'open5e' ? 'Customized from Open5e' : 'Your spell'),
+    aliases: aliasesFor(`c:${s.id}`, s.source?.slug),
+  }));
+  const copied = new Set(mine.map(s => s.slug).filter(Boolean));
+  const open = (spellIndex.list || []).filter(s => !copied.has(s.slug))
+    .map(s => ({ ...s, key: `o:${s.slug}`, school: (s.school || '').toLowerCase(), level: s.level ?? 0, mine: false, aliases: aliasesFor(`o:${s.slug}`) }));
+  return [...mine, ...open];
+}
+// Look up a key, following an Open5e spell to your customized copy if you made one
+function spellInfo(key) {
+  if (!key) return null;
+  if (key.startsWith('o:')) {
+    const copy = copyOf(key.slice(2));
+    if (copy) return spellCatalog().find(s => s.key === `c:${copy.id}`);
+  }
+  return spellCatalog().find(s => s.key === key) || null;
+}
+// Full spell for a card: your copy, or fetched from Open5e
+async function spellDetailFor(key) {
+  const withNames = (s, k, slug) => (s ? { ...s, aliases: aliasesFor(k, slug) } : s);
+  if (key.startsWith('c:')) { const s = findSpell(key.slice(2)); return withNames(s, key, s?.source?.slug); }
+  const slug = key.slice(2);
+  const copy = copyOf(slug);
+  if (copy) return withNames(copy, `c:${copy.id}`, slug);
+  const d = await bestiaryClient.spell(slug);
+  return withNames({ ...d, school: (d.school || '').toLowerCase(), book: d.source ? `${d.source} (Open5e)` : 'Open5e', source: { type: 'open5e', slug } }, key);
+}
+
+// Open a spell's card: in the Bestiary's right column when it's open, otherwise as a popup
+let spellCardTarget = null;
+function openSpellCard(key) {
+  if (spellCardTarget) return spellCardTarget(key);
+  document.querySelector('dialog.spell-popup')?.close();
+  const dialog = document.createElement('dialog');
+  dialog.className = 'spell-popup';
+  dialog.setAttribute('aria-label', 'Spell');
+  const close = el('button', 'icon-btn spell-popup-close', '✕');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Close the spell');
+  close.addEventListener('click', () => dialog.close());
+  const holder = el('div', 'spell-popup-body', 'Loading…');
+  dialog.append(close, holder);
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  spellDetailFor(key)
+    .then(s => holder.replaceChildren(s ? renderSpellCard(s) : el('p', '', 'That spell is no longer in your Spellbook.')))
+    .catch(err => { holder.textContent = `Couldn't load the spell (${err.message}).`; });
+}
+
+/* ---- Spellbook menu (DM view) ----
+   A browsable catalog of every Open5e spell plus your own. Only your spells (from your books, or
+   Open5e spells you customized) are saved; Open5e spells are always there without adding them. */
+function openSpellbook(selectKey = null, { edit = false } = {}) {
+  if (document.querySelector('dialog.spellbook-modal')) return;
+  let selected = selectKey, editing = edit && !!selectKey;
+  const f = { text: '', level: 'all', cls: 'all', school: 'all', source: 'all', mine: false };
+  const MAX_SHOWN = 300;
+
+  const dialog = document.createElement('dialog');
+  dialog.className = 'bestiary-modal spellbook-modal';
+  dialog.setAttribute('aria-labelledby', 'spellbook-title');
+  dialog.innerHTML = `
+    <div class="bst">
+      <header class="bst-head">
+        <h2 id="spellbook-title">Spellbook</h2>
+        <div class="bst-head-tools">
+          <button type="button" class="btn" data-refresh title="Download the Open5e spell list again">Refresh Open5e</button>
+          <button type="button" class="btn" data-close>Close</button>
+        </div>
+      </header>
+      <div class="bst-body">
+        <aside class="bst-side spl-side">
+          <input type="search" class="bst-filter" data-f="text" placeholder="Search spells…" aria-label="Search spells">
+          <div class="spl-filters">
+            <select class="bst-filter" data-f="level" aria-label="Level"></select>
+            <select class="bst-filter" data-f="cls" aria-label="Class"></select>
+            <select class="bst-filter" data-f="school" aria-label="School"></select>
+            <select class="bst-filter" data-f="source" aria-label="Source"></select>
+          </div>
+          <label class="bst-check"><input type="checkbox" data-f="mine"> Yours only</label>
+          <p class="spl-status" role="status"></p>
+          <ul class="bst-list" aria-label="Spells"></ul>
+          <button type="button" class="btn" data-new>+ New spell (from your books)</button>
+        </aside>
+        <section class="bst-main" aria-live="polite"></section>
+      </div>
+      <footer class="bst-foot"></footer>
+    </div>`;
+  document.body.append(dialog);
+  const $ = s => dialog.querySelector(s);
+  const listEl = $('.bst-list'), mainEl = $('.bst-main'), statusEl = $('.spl-status');
+
+  const saveRow = saveControls('dm-save-row');
+  $('.bst-foot').append(saveRow);
+  const onDmChange = () => { renderList(); saveRow.refresh(); };
+  onDmChange.statusOnly = saveRow.refresh;
+  dm.subscribe(onDmChange);
+  const offIndex = spellIndex.onChange(() => { fillFilters(); renderList(); if (!editing) renderMain(); });
+  dialog.addEventListener('close', () => { dm.unsubscribe(onDmChange); offIndex(); dialog.remove(); });
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  $('[data-close]').addEventListener('click', () => dialog.close());
+  $('[data-refresh]').addEventListener('click', () => { spellIndex.load(true).catch(err => { statusEl.textContent = `Couldn't load Open5e spells (${err.message}).`; }); renderList(); });
+
+  // Filter menus are built from whatever is in the catalog
+  function fillFilters() {
+    const cat = spellCatalog();
+    const opts = (key, all, values) => {
+      const sel = $(`[data-f="${key}"]`);
+      const keep = sel.value || 'all';
+      sel.replaceChildren(...[['all', all], ...values].map(([v, t]) => { const o = el('option', '', t); o.value = v; return o; }));
+      sel.value = [...sel.options].some(o => o.value === keep) ? keep : 'all';
+    };
+    opts('level', 'All levels', [...Array(10).keys()].map(l => [String(l), spellLevelShort(l) + (l === 0 ? 's' : '')]));
+    const classes = [...new Set(cat.flatMap(s => String(s.classes || '').split(',').map(c => c.trim()).filter(Boolean)))].sort();
+    opts('cls', 'All classes', classes.map(c => [c, c]));
+    opts('school', 'All schools', SPELL_SCHOOLS.map(sc => [sc.toLowerCase(), sc]));
+    // Open5e sources plus the books you've typed into your own spells
+    const sources = [...new Set(cat.map(s => (s.mine ? s.book : s.source)).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    sources.unshift('Yours');
+    opts('source', 'All sources', sources.map(s => [s, s]));
+  }
+  dialog.querySelectorAll('[data-f]').forEach(input => input.addEventListener(input.type === 'search' ? 'input' : 'change', () => {
+    f[input.dataset.f] = input.type === 'checkbox' ? input.checked : input.value;
+    renderList();
+  }));
+
+  function filtered() {
+    const words = nameKey(f.text).split(' ').filter(Boolean);
+    return spellCatalog().filter(s =>
+      (!f.mine || s.mine) &&
+      (f.level === 'all' || s.level === Number(f.level)) &&
+      (f.cls === 'all' || String(s.classes || '').split(',').map(c => c.trim()).includes(f.cls)) &&
+      (f.school === 'all' || (s.school || '').toLowerCase() === f.school) &&
+      (f.source === 'all' || (f.source === 'Yours' ? s.mine : (s.mine ? s.book === f.source : s.source === f.source))) &&
+      spellMatch(s, words).ok)
+      .map(s => ({ ...s, via: spellMatch(s, words).via }))
+      .sort((a, b) => a.level - b.level || a.name.localeCompare(b.name));
+  }
+
+  function renderList() {
+    const spells = filtered();
+    listEl.replaceChildren();
+    const idx = spellIndex.list;
+    statusEl.textContent = !idx && spellIndex.loading
+      ? `Loading Open5e spells… ${spellIndex.progress.loaded}${spellIndex.progress.total ? ` of ${spellIndex.progress.total}` : ''}`
+      : !idx ? 'Open5e spells not loaded.' : `${spells.length.toLocaleString()} spell${spells.length === 1 ? '' : 's'}${spells.length > MAX_SHOWN ? ` (showing ${MAX_SHOWN}; narrow it down)` : ''}`;
+    if (!spells.length) listEl.append(el('li', 'dm-empty', idx ? 'No spells match.' : 'Your own spells will show here; Open5e spells appear once loaded.'));
+    let lastLevel = null;
+    spells.slice(0, MAX_SHOWN).forEach(s => {
+      if (s.level !== lastLevel) { listEl.append(el('li', 'bst-results-head', s.level === 0 ? 'Cantrips' : `Level ${s.level}`)); lastLevel = s.level; }
+      const li = el('li');
+      const b = el('button', 'bst-item');
+      b.type = 'button';
+      b.setAttribute('aria-pressed', String(s.key === selected));
+      const nameSpan = el('span', 'bst-item-name', s.name);
+      if (s.via) nameSpan.append(el('span', 'spl-via', ` · aka ${s.via}`));
+      b.append(nameSpan);
+      if (s.mine) b.append(el('span', 'bst-item-party spl-mine', 'Yours'));
+      if (s.concentration) b.append(el('span', 'bst-item-cr', 'C'));
+      if (s.ritual) b.append(el('span', 'bst-item-cr', 'R'));
+      b.title = [s.school && titleCase(s.school), s.classes, s.source].filter(Boolean).join(' · ');
+      b.addEventListener('click', () => { selected = s.key; editing = false; renderList(); renderMain(); });
+      li.append(b);
+      listEl.append(li);
+    });
+  }
+
+  async function renderMain() {
+    mainEl.replaceChildren();
+    mainEl.classList.toggle('is-editing', editing);
+    if (!selected) { mainEl.append(el('p', 'bst-empty', 'Pick a spell on the left. Every Open5e spell is here; add spells from your books with "+ New spell".')); return; }
+    const info = spellInfo(selected);
+    const key = info?.key || selected;
+    const isMine = key.startsWith('c:');
+    if (isMine && editing) return renderEdit(findSpell(key.slice(2)));
+
+    const head = el('div', 'bst-view-head');
+    const actions = el('div', 'spl-actions');
+    const button = (text, fn, cls = 'btn') => { const b = el('button', cls, text); b.type = 'button'; b.addEventListener('click', fn); return b; };
+    if (isMine) {
+      const sp = findSpell(key.slice(2));
+      head.append(el('span', 'bst-source', sp?.source?.type === 'open5e' ? 'Your customized copy of an Open5e spell' : (sp?.book || 'Your spell')));
+      actions.append(button('Edit', () => { editing = true; renderMain(); }));
+      if (sp?.source?.type === 'open5e') {
+        actions.append(button('Revert to Open5e', () => {
+          if (!confirm(`Remove your customized copy of ${sp.name} and use the Open5e version again?`)) return;
+          selected = `o:${sp.source.slug}`;
+          dm.update(d => { d.spells = d.spells.filter(s => s.id !== sp.id); });
+          renderMain();
+        }));
+      }
+    } else {
+      head.append(el('span', 'bst-source', 'Open5e'));
+      actions.append(button('Customize', async () => {
+        try {
+          const d = await spellDetailFor(key);
+          const id = newId();
+          dm.update(dd => { dd.spells.push({
+            id, name: d.name, level: d.level ?? 0, school: d.school, castingTime: d.castingTime, range: d.range, components: d.components,
+            material: d.material, duration: d.duration, concentration: !!d.concentration, ritual: !!d.ritual, classes: d.classes,
+            desc: d.desc, higherLevel: d.higherLevel, book: '', notes: '', source: { type: 'open5e', slug: key.slice(2) },
+          }); });
+          selected = `c:${id}`; editing = true; renderList(); renderMain();
+        } catch (err) { alert(`Couldn't load the spell (${err.message}).`); }
+      }));
+    }
+    head.append(actions);
+    mainEl.append(head, otherNamesField(key));
+    const holder = el('div', 'spl-card-holder', 'Loading…');
+    mainEl.append(holder);
+    try {
+      const s = await spellDetailFor(key);
+      if (selected === key || spellInfo(selected)?.key === key) holder.replaceChildren(s ? renderSpellCard(s) : el('p', '', 'Spell not found.'));
+    } catch (err) {
+      holder.textContent = `Couldn't load the spell (${err.message}).`;
+    }
+  }
+
+  // Other names: edit without entering edit mode, so Open5e spells can have them too
+  function otherNamesField(key) {
+    const lab = el('label', 'bst-field wide spl-aliases');
+    lab.append(el('span', 'bst-label', 'Other names (comma-separated; searchable)'));
+    const input = el('input', 'init-input');
+    input.type = 'text';
+    input.value = splitNames(dm.data.spellAliases?.[key]).join(', ');
+    input.placeholder = "e.g. Melf's Acid Arrow";
+    input.addEventListener('change', () => {
+      const names = splitNames(input.value);
+      dm.update(d => {
+        d.spellAliases = { ...(d.spellAliases || {}) };
+        if (names.length) d.spellAliases[key] = names.join(', ');
+        else delete d.spellAliases[key];
+      }, { quiet: true });
+      input.value = names.join(', ');
+      renderList();
+      const card = mainEl.querySelector('.spell-card');
+      if (card) spellDetailFor(key).then(s => { if (s) card.replaceWith(renderSpellCard(s)); });
+    });
+    lab.append(input);
+    return lab;
+  }
+
+  // Edit mode for your own spells (hand-entered or customized copies)
+  function renderEdit(spell) {
+    if (!spell) { editing = false; return renderMain(); }
+    const current = () => findSpell(spell.id) || spell;
+    const set = (mutate) => {
+      dm.update(d => { const s = d.spells.find(x => x.id === spell.id); if (s) mutate(s); }, { quiet: true });
+      fillFilters(); renderList(); drawPreview();
+    };
+    const top = el('div', 'bst-editor-top');
+    const done = el('button', 'btn primary bst-done', 'Done');
+    done.type = 'button';
+    done.addEventListener('click', () => { editing = false; renderMain(); });
+    top.append(el('span', 'bst-source', spell.source?.type === 'open5e' ? 'Customized from Open5e' : 'Hand-entered'), done);
+    mainEl.append(top);
+
+    const group = title => { const g = el('fieldset', 'bst-group'); g.append(el('legend', '', title)); return g; };
+    const text = (label, key, { cls = '', placeholder = '' } = {}) => {
+      const lab = el('label', `bst-field ${cls}`);
+      lab.append(el('span', 'bst-label', label));
+      const i = el('input', 'init-input');
+      i.type = 'text'; i.value = spell[key] ?? ''; i.placeholder = placeholder;
+      i.addEventListener('change', () => set(s => { s[key] = i.value.trim(); }));
+      lab.append(i);
+      return lab;
+    };
+    const area = (label, key, rows, placeholder = '') => {
+      const lab = el('label', 'bst-field wide');
+      lab.append(el('span', 'bst-label', label));
+      const t = el('textarea', 'init-notes bst-desc');
+      t.rows = rows; t.value = spell[key] || ''; t.placeholder = placeholder;
+      t.addEventListener('change', () => set(s => { s[key] = t.value; }));
+      lab.append(t);
+      return lab;
+    };
+    const check = (label, key) => {
+      const lab = el('label', 'bst-check');
+      const c = el('input'); c.type = 'checkbox'; c.checked = !!spell[key];
+      c.addEventListener('change', () => set(s => { s[key] = c.checked; }));
+      lab.append(c, document.createTextNode(` ${label}`));
+      return lab;
+    };
+    const select = (label, key, options, parse = v => v) => {
+      const lab = el('label', 'bst-field');
+      lab.append(el('span', 'bst-label', label));
+      const sel = el('select', 'init-input');
+      options.forEach(([v, t]) => { const o = el('option', '', t); o.value = v; sel.append(o); });
+      sel.value = String(spell[key] ?? options[0][0]);
+      sel.addEventListener('change', () => set(s => { s[key] = parse(sel.value); }));
+      lab.append(sel);
+      return lab;
+    };
+
+    const basics = group('Spell');
+    const grid = el('div', 'bst-grid');
+    grid.append(
+      text('Name', 'name', { cls: 'span2', placeholder: 'Toll the Dead' }),
+      select('Level', 'level', [...Array(10).keys()].map(l => [String(l), spellLevelShort(l)]), Number),
+      select('School', 'school', [['', '—'], ...SPELL_SCHOOLS.map(sc => [sc.toLowerCase(), sc])]),
+      text('Casting time', 'castingTime', { placeholder: '1 action' }),
+      text('Range', 'range', { placeholder: '60 feet' }),
+      text('Components', 'components', { placeholder: 'V, S, M' }),
+      text('Duration', 'duration', { placeholder: 'Instantaneous' }),
+      text('Material', 'material', { cls: 'span2', placeholder: 'A tiny bell' }),
+      text('Classes', 'classes', { cls: 'span2', placeholder: 'Cleric, Warlock, Wizard' }),
+    );
+    const flags = el('div', 'bst-flags');
+    flags.append(check('Concentration', 'concentration'), check('Ritual', 'ritual'));
+    basics.append(grid, flags);
+    const textGroup = group('Text');
+    textGroup.append(area('Description', 'desc', 8, 'What the spell does…'),
+      area('At higher levels', 'higherLevel', 2, 'When you cast this spell using a spell slot of …'));
+    const srcGroup = group('Source & notes');
+    const bookField = text('Book & page', 'book', { cls: 'wide', placeholder: "Player's Handbook p. 247" });
+    // Suggest books you've already used, so the source menu stays tidy
+    const books = el('datalist');
+    books.id = 'spl-book-names';
+    [...new Set(dm.data.spells.map(s => bookName(s.book)).filter(Boolean))].sort().forEach(b => { const o = el('option'); o.value = b; books.append(o); });
+    bookField.querySelector('input').setAttribute('list', books.id);
+    bookField.append(books);
+    srcGroup.append(bookField, otherNamesField(`c:${spell.id}`), area('Your notes', 'notes', 2, 'Rulings, reminders…'));
+    const bottom = el('div', 'bst-actions');
+    const del = el('button', 'btn danger', 'Delete spell');
+    del.type = 'button';
+    del.addEventListener('click', () => {
+      if (!confirm(`Delete "${spell.name}" from your Spellbook?`)) return;
+      dm.update(d => { d.spells = d.spells.filter(s => s.id !== spell.id); });
+      selected = spell.source?.type === 'open5e' ? `o:${spell.source.slug}` : null;
+      editing = false; renderMain();
+    });
+    bottom.append(del);
+    const previewGroup = group('Preview');
+    const preview = el('div', 'spl-preview');
+    previewGroup.append(preview);
+    mainEl.append(basics, textGroup, srcGroup, bottom, previewGroup);
+    function drawPreview() { preview.replaceChildren(renderSpellCard({ ...current(), aliases: aliasesFor(`c:${spell.id}`, spell.source?.slug) })); }
+    drawPreview();
+  }
+
+  // New hand-entered spell (opens in edit mode)
+  $('[data-new]').addEventListener('click', () => {
+    const id = newId();
+    dm.update(d => { d.spells.push({ id, name: 'New spell', level: 0, school: '', castingTime: '1 action', range: '', components: '', material: '', duration: '', concentration: false, ritual: false, classes: '', desc: '', higherLevel: '', book: '', notes: '', source: null }); });
+    selected = `c:${id}`; editing = true; renderList(); renderMain();
+    const name = mainEl.querySelector('.bst-field input');
+    name?.focus(); name?.select();
+  });
+
+  fillFilters();
+  renderList();
+  renderMain();
+  dialog.showModal();
+  // Load the Open5e list the first time (later opens use the cached copy)
+  if (!spellIndex.list) spellIndex.load().catch(err => { statusEl.textContent = `Couldn't load Open5e spells (${err.message}). Your own spells still work.`; });
+}
+
+if (DMVIEW) {
+  new SessionPanel().addTo(map);
+  new PartyPanel().addTo(map);   // sits directly above the session links
+  new InitiativeTracker().addTo(map);
+  const dmBanner = createUnsavedBanner({
+    dirty: () => dm.dirty,
+    saving: () => dm.saving,
+    problem: () => dm.problem,
+    save: () => dm.save(),
+  });
+  const refreshBanner = () => dmBanner.refresh();
+  refreshBanner.statusOnly = dmBanner.refresh;
+  dm.subscribe(refreshBanner);
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); dm.save(); }
+  });
+  // Warn before leaving with changes that haven't been uploaded with Save.
+  // (They're still kept in this browser; this is about your other devices.)
+  window.addEventListener('beforeunload', e => {
+    if (!dm.dirty) return;
+    e.preventDefault();
+    e.returnValue = '';   // older browsers need this to show the dialog
+  });
+}
+
 if (!EDIT) {
   subPanel = new SubPanel().addTo(map);   // closes along with its pin's popup
   document.addEventListener('keydown', e => {
@@ -1033,6 +3995,7 @@ const editor = {
   showPlayerFog: false,
 };
 let editPanel = null;
+let editorBanner = null;   // the unsaved-changes pill (editor)
 let lastType = 'pin';
 let lastKind = null;   // the kind picked most recently, reused for the next new pin
 
@@ -1263,6 +4226,7 @@ function statusTag(status) {
     private: ['Private', 'tag-private'],
     'visibility unknown': ['Visibility unknown', 'tag-warn'],
     missing: ['Missing in Notion', 'tag-warn'],
+    unlinked: ['Unlinked', 'tag-muted'],
   }[status] || ['', 'tag-muted'];
 }
 
@@ -1495,7 +4459,7 @@ function imagePoint(e) {
   return [Math.round(clamp(ll.lng, 0, W)), Math.round(clamp(H - ll.lat, 0, H))];
 }
 
-const isOnUi = e => e.target.closest('.leaflet-control, .leaflet-popup, .map-search');
+const isOnUi = e => e.target.closest('.leaflet-control, .leaflet-popup, .map-search, .unsaved-banner');
 
 function startDrawing(e) {
   if (!isFogTool(editor.tool) || e.button !== 0 || isOnUi(e)) return;
@@ -1552,10 +4516,7 @@ function finishDrawing(e) {
 if (EDIT) {
   container.classList.add('editing');
 
-  // Save right away when the tab is hidden, and warn before closing with unsaved changes
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') saver.flush();
-  });
+  // Warn before closing with changes that haven't been uploaded with Save (they're still kept in this browser)
   window.addEventListener('beforeunload', e => {
     if (saver.dirty()) { e.preventDefault(); e.returnValue = ''; }
   });
@@ -1585,9 +4546,11 @@ if (EDIT) {
 
   document.addEventListener('keydown', e => {
     const el = document.activeElement;
-    if ((el.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'button'].includes(el.type)) || el.tagName === 'TEXTAREA') return;
     if (!(e.ctrlKey || e.metaKey)) return;
     const key = e.key.toLowerCase();
+    // Ctrl/Cmd + S uploads to the worker, even while typing in a field
+    if (key === 's') { e.preventDefault(); saver.flush(); return; }
+    if ((el.tagName === 'INPUT' && !['range', 'checkbox', 'radio', 'button'].includes(el.type)) || el.tagName === 'TEXTAREA') return;
     if (key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
     else if ((key === 'z' && e.shiftKey) || key === 'y') { e.preventDefault(); redo(); }
   });
@@ -1646,7 +4609,10 @@ if (EDIT) {
 
         <hr>
         <p data-count></p>
-        <p class="muted" data-status role="status"></p>
+        <div class="dm-save-row editor-save">
+          <span class="dm-status" data-status role="status"></span>
+          <button type="button" class="btn primary" data-save title="Upload to the worker (Ctrl/Cmd + S)">Save</button>
+        </div>
         <p class="notion-error" data-notion-error role="alert"></p>
         <div class="row">
           <button type="button" class="btn" data-sync>Sync from Notion</button>
@@ -1658,6 +4624,7 @@ if (EDIT) {
 
       const $ = sel => panel.querySelector(sel);
       $('[data-settings]').addEventListener('click', openSettings);
+      $('[data-save]').addEventListener('click', () => saver.flush());
 
       panel.querySelectorAll('[data-tool]').forEach(b => b.addEventListener('click', () => setTool(b.dataset.tool)));
       panel.querySelectorAll('[data-shape]').forEach(b => b.addEventListener('click', () => {
@@ -1714,8 +4681,8 @@ if (EDIT) {
       });
 
       const STATUS_TEXT = {
-        saved: 'All changes saved.',
-        pending: 'Unsaved changes…',
+        saved: 'Saved',
+        pending: 'Unsaved changes',
         saving: 'Saving…',
       };
 
@@ -1745,12 +4712,24 @@ if (EDIT) {
           `${p} ${p === 1 ? 'place' : 'places'}${l ? ` (${l} on sky islands)` : ''}` +
           (flags.length ? ` (${flags.join(', ')})` : '') + `. ${locations.size} Notion locations.`;
 
-        $('[data-status]').textContent = STATUS_TEXT[saver.status] || saver.message;
+        const statusEl = $('[data-status]');
+        statusEl.textContent = STATUS_TEXT[saver.status] || saver.message;
+        statusEl.classList.toggle('is-unsaved', saver.status === 'pending');
+        statusEl.classList.toggle('is-problem', saver.status === 'error' || saver.status === 'conflict');
+        $('[data-save]').disabled = saver.saving || !saver.dirty() || saver.status === 'conflict';
+        editorBanner?.refresh();
         $('[data-notion-error]').hidden = !notionError;
         $('[data-notion-error]').textContent = notionError ? `Notion sync failed: ${notionError}` : '';
       };
       return panel;
     },
+  });
+  editorBanner = createUnsavedBanner({
+    dirty: () => saver.dirty(),
+    saving: () => saver.saving,
+    problem: () => (saver.status === 'error' || saver.status === 'conflict' ? saver.message : ''),
+    conflict: () => saver.status === 'conflict',
+    save: () => saver.flush(),
   });
   editPanel = new EditControl().addTo(map);
   editPanel.update();
@@ -1774,7 +4753,7 @@ function searchablePlaces() {
   data.pins.forEach(pin => {
     // Fixed places are checked where they are; drifting ones where they've floated to right now
     const spot = pin.drifts ? pinMarkers.get(pin.id)?.getLatLng() : L.latLng(H - pin.y, pin.x);
-    if (!EDIT && CONFIG.fog.enabled && (!spot || !Fog.isRevealed(spot.lng, H - spot.lat))) return;
+    if (PLAYER_FOG && CONFIG.fog.enabled && (!spot || !Fog.isRevealed(spot.lng, H - spot.lat))) return;
     const info = placeInfo(pin);
     const kindLabel = pin.drifts ? `${pinKind(pin)} · sky island` : pinKind(pin);
     found.push({ place: pin, kind: 'pin', info, kindLabel });
@@ -1847,11 +4826,41 @@ function goToParty() {
 
   const input = bar.querySelector('.combo-input');
   const list = bar.querySelector('.combo-list');
+  // "/spell <name>" searches spells (DM view and editor only; spells come through your edit key)
+  const SPELL_SEARCH = EDIT || DMVIEW;
+  if (SPELL_SEARCH) {
+    input.placeholder = 'Search places · /s for spells  ( / )';
+    input.setAttribute('aria-label', 'Search places, or type /s to search spells');
+  }
 
-  createCombobox({
+  const box = createCombobox({
     input,
     list,
     getOptions(query) {
+      // "/s", "/spell" or "/spells", then the name
+      const spellMode = SPELL_SEARCH && query.match(/^\s*\/(?:s|spells?)\b\s*(.*)$/i);
+      if (spellMode) {
+        const words = nameKey(spellMode[1]).split(' ').filter(Boolean);
+        if (!spellIndex.list && !spellIndex.loading) spellIndex.load().then(() => box.refresh()).catch(() => box.refresh());
+        const found = words.length ? spellCatalog().map(s => ({ ...s, ...spellMatch(s, words) })).filter(s => s.ok) : [];
+        // Exact and starts-with matches first (by name or other name), then your spells, then by level
+        const term = words.join(' ');
+        const rank = s => { const n = nameKey(s.via || s.name); return n === term ? 0 : n.startsWith(term) ? 1 : 2; };
+        found.sort((a, b) => rank(a) - rank(b) || (b.mine - a.mine) || a.level - b.level || a.name.localeCompare(b.name));
+        const notes = [];
+        if (!spellIndex.list) notes.push(spellIndex.loading ? 'Loading Open5e spells…' : 'Open5e spells unavailable; showing your own.');
+        if (!words.length) notes.unshift('Spell search · type a spell name');
+        else if (!found.length && spellIndex.list) notes.push('No matching spells');
+        if (found.length > SEARCH_LIMIT) notes.push(`${found.length - SEARCH_LIMIT} more · keep typing to narrow it down`);
+        return {
+          options: found.slice(0, SEARCH_LIMIT).map(s => ({
+            spellKey: s.key,
+            label: s.name,
+            detail: [s.via && `aka ${s.via}`, s.level === 0 ? 'Cantrip' : `Level ${s.level}`, s.school && titleCase(s.school), s.mine && 'Yours'].filter(Boolean).join(' · '),
+          })),
+          notes,
+        };
+      }
       const q = nameKey(query);
       const found = searchablePlaces().filter(({ info }) =>
         !q || nameKey(info.name).includes(q) || nameKey(info.aliases).includes(q));
@@ -1863,12 +4872,14 @@ function goToParty() {
       const notes = [];
       if (!found.length) notes.push(query ? 'No matching places' : 'No places on the map yet');
       if (found.length > SEARCH_LIMIT) notes.push(`${found.length - SEARCH_LIMIT} more · keep typing to narrow it down`);
+      if (SPELL_SEARCH && !query) notes.push('Tip: /s fireball searches spells');
       return { options, notes };
     },
     onChoose(item) {
       input.value = '';
       input.blur();
-      goToPlace(item);
+      if (item.spellKey) openSpellCard(item.spellKey);   // centered card
+      else goToPlace(item);
     },
   });
 
@@ -2049,31 +5060,28 @@ function placeTypesSection() {
    Only shown in a browser that has the edit key, so players never see it.
    ========================================================================== */
 (() => {
-  if (!EDIT && !PREVIEW && !storageGet(EDIT_KEY_STORAGE)) return;
-  const current = EDIT ? 'edit' : PREVIEW ? 'preview' : 'player';
+  if (!EDIT && !DMVIEW && !storageGet(EDIT_KEY_STORAGE)) return;
+  const current = EDIT ? 'edit' : DMVIEW ? 'dm' : 'player';
   const listEl = layersControl.getContainer().querySelector('.leaflet-control-layers-list');
   const section = document.createElement('fieldset');
   section.className = 'view-switch';
   section.innerHTML = `
     <legend>View</legend>
     <label><input type="radio" name="map-view" value="player"> Player</label>
-    <label><input type="radio" name="map-view" value="preview"> Preview (all places)</label>
+    <label><input type="radio" name="map-view" value="dm"> DM view</label>
     <label><input type="radio" name="map-view" value="edit"> Editor</label>`;
   section.querySelector(`input[value="${current}"]`).checked = true;
   section.addEventListener('change', e => {
     const params = new URLSearchParams(location.search);
     params.delete('edit');
     params.delete('preview');
+    params.delete('dm');
     if (e.target.value !== 'player') params.set(e.target.value, '');
     const query = params.toString().replace(/=(&|$)/g, '$1');   // "?preview" rather than "?preview="
     location.href = location.pathname + (query ? `?${query}` : '') + location.hash;
   });
   listEl.append(section);
 
-  if (PREVIEW) {
-    const badge = L.DomUtil.create('div', 'preview-badge', container);
-    badge.textContent = 'Preview · all places shown';
-  }
 })();
 
 /* ==========================================================================
