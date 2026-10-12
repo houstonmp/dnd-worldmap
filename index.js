@@ -1224,7 +1224,248 @@ function createUnsavedBanner({ dirty, saving, problem, conflict = () => false, s
   return { refresh };
 }
 
-/* ---- Party at a glance: AC, passive Perception and initiative (Dex) for everyone tagged Party ---- */
+/* ---- Status popup (from the ◇ on an initiative row) ----
+   Temp HP, exhaustion, conditions (with 2014 reminders) and lingering effects with "lasts until".
+   For Party members, sidekicks and on-call creatures this is saved on their Bestiary entry,
+   so it carries between fights; for everyone else it belongs to this fight. */
+function openStatusPopup(combatantId) {
+  document.querySelector('dialog.status-popup')?.close();
+  const dialog = document.createElement('dialog');
+  dialog.className = 'status-popup';
+  dialog.setAttribute('aria-label', 'Status');
+  const body = el('div', 'stp-body');
+  const foot = el('footer', 'cp-foot');
+  const done = el('button', 'btn primary', 'Done');
+  done.type = 'button';
+  done.addEventListener('click', () => dialog.close());
+  foot.append(el('span', 'cp-note', ''), done);
+  dialog.append(body, foot);
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  dialog.addEventListener('close', () => dialog.remove());
+  document.body.append(dialog);
+
+  // Change the status where it lives (tracked creature or this row), then redraw
+  const change = fn => {
+    dm.update(d => {
+      const t = d.tracker.combatants.find(x => x.id === combatantId);
+      if (!t) return;
+      const holder = statusHolder(d, t);
+      fn(holder, t, d);
+      if (holder !== t) Object.assign(t, { tempHp: holder.tempHp ?? null, exhaustion: holder.exhaustion || 0 });
+    });
+    draw();
+  };
+  const section = title => { const s = el('section', 'stp-section'); s.append(el('h4', 'stp-title', title)); return s; };
+
+  function draw() {
+    const t = dm.data.tracker.combatants.find(x => x.id === combatantId);
+    if (!t) { dialog.close(); return; }
+    const s = statusFor(t);
+    const tracked = s !== t;
+    body.replaceChildren();
+    const head = el('header', 'stp-head');
+    head.append(el('h3', '', t.name || 'Combatant'), el('span', 'stp-sub', tracked
+      ? `${ROLES[roleOf(s)]} · carries between fights` : 'This fight only'));
+    body.append(head);
+
+    // Temp HP
+    const temp = section('Temporary HP');
+    const tempIn = el('input', 'init-input stp-num');
+    tempIn.type = 'number'; tempIn.min = '0'; tempIn.value = s.tempHp ?? '';
+    tempIn.placeholder = '0';
+    tempIn.setAttribute('aria-label', 'Temporary hit points');
+    tempIn.addEventListener('change', () => change(h => { const n = Math.max(0, Math.round(Number(tempIn.value) || 0)); h.tempHp = n || null; }));
+    temp.append(tempIn, el('span', 'stp-hint', 'Damage comes off this first.'));
+    body.append(temp);
+
+    // Exhaustion
+    const ex = section('Exhaustion');
+    const exRow = el('div', 'stp-ex');
+    const level = s.exhaustion || 0;
+    const step = dir => change((h, row, d) => {
+      h.exhaustion = Math.min(6, Math.max(0, (h.exhaustion || 0) + dir));
+      // Level 4 halves max HP: bring current HP down to it
+      const cap = effectiveMax(row.maxHp, h);
+      if (cap != null && row.hp != null && row.hp > cap) { row.hp = cap; keepTrackedHp(d, row); }
+    });
+    const minus = el('button', 'icon-btn', '−'); minus.type = 'button'; minus.disabled = level === 0;
+    minus.setAttribute('aria-label', 'Remove a level of exhaustion'); minus.addEventListener('click', () => step(-1));
+    const plus = el('button', 'icon-btn', '+'); plus.type = 'button'; plus.disabled = level === 6;
+    plus.setAttribute('aria-label', 'Add a level of exhaustion'); plus.addEventListener('click', () => step(1));
+    exRow.append(minus, el('strong', 'stp-ex-level', String(level)), plus);
+    ex.append(exRow);
+    const exList = el('ol', 'stp-ex-list');
+    EXHAUSTION.slice(1).forEach((txt, i) => { const li = el('li', i < level ? 'is-on' : '', txt); exList.append(li); });
+    ex.append(exList, el('p', 'stp-hint', 'A long rest removes one level (with food and drink).'));
+    body.append(ex);
+
+    // Conditions
+    const cond = section('Conditions');
+    const chips = el('div', 'stp-chips');
+    const active = new Set(s.conditions || []);
+    [...Object.keys(CONDITIONS), ...[...active].filter(c => !(c in CONDITIONS))].forEach(name => {
+      const b = el('button', 'stp-chip', name);
+      b.type = 'button';
+      b.setAttribute('aria-pressed', String(active.has(name)));
+      b.title = CONDITIONS[name] || 'Custom condition';
+      b.addEventListener('click', () => change(h => {
+        const set = new Set(h.conditions || []);
+        set.has(name) ? set.delete(name) : set.add(name);
+        h.conditions = [...set];
+      }));
+      chips.append(b);
+    });
+    cond.append(chips);
+    const custom = el('div', 'stp-add');
+    const customIn = el('input', 'init-input'); customIn.type = 'text'; customIn.placeholder = 'Other condition…';
+    customIn.setAttribute('aria-label', 'Add another condition');
+    const addCustom = () => { const v = customIn.value.trim(); if (v) change(h => { h.conditions = [...new Set([...(h.conditions || []), v])]; }); };
+    customIn.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addCustom(); } });
+    const addBtn = el('button', 'btn', 'Add'); addBtn.type = 'button'; addBtn.addEventListener('click', addCustom);
+    custom.append(customIn, addBtn);
+    cond.append(custom);
+    if (active.size) {
+      const rem = el('ul', 'stp-reminders');
+      [...active].forEach(name => {
+        const li = el('li');
+        li.append(el('strong', '', `${name}. `), document.createTextNode(CONDITIONS[name] || 'Custom condition.'));
+        if (INCLUDES_INCAPACITATED.includes(name)) li.append(el('em', '', ' (includes Incapacitated)'));
+        rem.append(li);
+      });
+      cond.append(rem);
+    }
+    cond.append(el('p', 'stp-hint', tracked ? 'Conditions clear when you Clear the tracker.' : ''));
+    body.append(cond);
+
+    // Lingering effects
+    const fx = section('Lingering effects');
+    (s.effects || []).forEach((e, i) => {
+      const row = el('div', 'stp-effect');
+      row.append(el('span', 'stp-effect-text', e.text));
+      const until = el('select', 'init-input');
+      Object.entries(UNTIL).forEach(([v, label]) => { const o = el('option', '', label); o.value = v; until.append(o); });
+      until.value = e.until;
+      until.setAttribute('aria-label', `When "${e.text}" ends`);
+      until.addEventListener('change', () => change(h => { h.effects[i].until = until.value; }));
+      const rm = el('button', 'icon-btn danger', '×'); rm.type = 'button';
+      rm.setAttribute('aria-label', `Remove "${e.text}"`);
+      rm.addEventListener('click', () => change(h => { h.effects.splice(i, 1); }));
+      row.append(until, rm);
+      fx.append(row);
+    });
+    const addFx = el('div', 'stp-add');
+    const fxIn = el('input', 'init-input'); fxIn.type = 'text'; fxIn.placeholder = 'e.g. Cursed by the hag: −5 max HP';
+    fxIn.setAttribute('aria-label', 'New lingering effect');
+    const fxUntil = el('select', 'init-input');
+    Object.entries(UNTIL).forEach(([v, label]) => { const o = el('option', '', label); o.value = v; fxUntil.append(o); });
+    fxUntil.value = 'rest';
+    fxUntil.setAttribute('aria-label', 'When it ends');
+    const addEffect = () => { const v = fxIn.value.trim(); if (v) change(h => { h.effects = [...(h.effects || []), { text: v, until: fxUntil.value }]; }); };
+    fxIn.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addEffect(); } });
+    const fxBtn = el('button', 'btn', 'Add'); fxBtn.type = 'button'; fxBtn.addEventListener('click', addEffect);
+    addFx.append(fxIn, fxUntil, fxBtn);
+    fx.append(addFx, el('p', 'stp-hint', 'End of fight: cleared with Clear. Long rest: cleared by Long rest. Until removed: stays until you remove it.'));
+    body.append(fx);
+  }
+  draw();
+  dialog.showModal();
+}
+
+/* ---- Party at a glance: AC, passive Perception, initiative and current HP ----
+   Party members, then sidekicks, then on-call creatures. HP here carries between fights: edit it between
+   encounters (+5 / -7 work). Hover a name for a status card. Long rest restores everyone. */
+const hpStateOf = (hp, max) => (hp == null ? '' : hp <= 0 ? 'hp-down' : !max ? '' : hp / max <= 0.25 ? 'hp-critical' : hp / max <= 0.5 ? 'hp-bloodied' : 'hp-healthy');
+
+// A small card that appears beside an element on hover or keyboard focus
+function attachHoverCard(anchor, build) {
+  let card = null;
+  const show = () => {
+    hide();
+    card = el('div', 'hover-card');
+    card.setAttribute('role', 'tooltip');
+    card.append(build());
+    document.body.append(card);
+    const r = anchor.getBoundingClientRect();
+    const w = card.offsetWidth, h = card.offsetHeight;
+    let left = r.right + 12, top = r.top - 8;
+    if (left + w > innerWidth - 8) left = Math.max(8, r.left - w - 12);
+    if (top + h > innerHeight - 8) top = Math.max(8, innerHeight - h - 8);
+    card.style.left = `${left}px`;
+    card.style.top = `${top}px`;
+  };
+  const hide = () => { card?.remove(); card = null; };
+  anchor.addEventListener('mouseenter', show);
+  anchor.addEventListener('mouseleave', hide);
+  anchor.addEventListener('focus', show);
+  anchor.addEventListener('blur', hide);
+  anchor.addEventListener('click', hide);
+}
+
+// What the hover card shows for a tracked character
+function partyCard(c) {
+  const wrap = el('div', 'pc-card');
+  wrap.append(el('h4', 'pc-name', creatureName(c)));
+  const who = [ROLES[roleOf(c)], c.level && `Level ${c.level}${c.className ? ` ${c.className}` : ''}`, c.player && `played by ${c.player}`].filter(Boolean).join(' · ');
+  if (who) wrap.append(el('div', 'pc-sub', who));
+  const max = effectiveMax(c.hp, c);
+  const cur = c.currentHp ?? c.hp;
+  const init = c.initBonus ?? (c.statblock?.abilities ? abilityMod(c.statblock.abilities.dex) : null);
+  const stats = el('div', 'pc-stats');
+  const stat = (k, v) => { const s = el('div', 'pc-stat'); s.append(el('span', 'pc-k', k), v instanceof Node ? v : el('span', 'pc-v', v ?? '–')); stats.append(s); };
+  stat('AC', c.ac ?? '–'); stat('PP', c.passive ?? '–'); stat('Init', init == null ? '–' : signed(init));
+  const hpV = el('span', `pc-v ${hpStateOf(cur, max)}`, `${cur ?? '–'}${max != null ? `/${max}` : ''}${c.tempHp ? ` +${c.tempHp}` : ''}`);
+  stat('HP', hpV);
+  wrap.append(stats);
+  const adj = adjustedSpeed(c.statblock?.speed, c);
+  if (c.statblock?.speed) {
+    const p = el('p', 'pc-line');
+    p.append(el('strong', '', 'Speed '));
+    if (adj.changed) p.append(el('s', 'sb-struck', c.statblock.speed), document.createTextNode(' '), el('strong', 'sb-adjusted', adj.text), el('span', 'sb-reason', ` (${adj.reason})`));
+    else p.append(document.createTextNode(c.statblock.speed));
+    wrap.append(p);
+  }
+  appendStatusLines(wrap, c);
+  return wrap;
+}
+
+// Exhaustion, conditions and lingering effects, as lines in a status card
+function appendStatusLines(wrap, s) {
+  if (s.exhaustion) { const p = el('p', 'pc-line pc-warn'); p.append(el('strong', '', `Exhaustion ${s.exhaustion}. `), document.createTextNode(exhaustionSummary(s.exhaustion))); wrap.append(p); }
+  (s.conditions || []).forEach(n => { const p = el('p', 'pc-line'); p.append(el('strong', '', `${n}. `), document.createTextNode(CONDITIONS[n] || 'Custom condition')); wrap.append(p); });
+  (s.effects || []).forEach(e => { const p = el('p', 'pc-line'); p.append(el('strong', '', `${e.text} `), el('span', 'pc-until', `(${UNTIL[e.until]})`)); wrap.append(p); });
+  if (!s.exhaustion && !(s.conditions || []).length && !(s.effects || []).length) wrap.append(el('p', 'pc-line pc-ok', 'No conditions or lingering effects. Click to add.'));
+}
+
+// The same card for an initiative row: characters with a role get their Party card;
+// everyone else gets one built from their row (this fight's HP, AC and status)
+function combatantCard(t) {
+  const creature = t.source?.type === 'library' ? findCreature(t.source.slug) : null;
+  if (creature && isTracked(creature)) return partyCard(creature);
+  const s = statusFor(t);
+  const wrap = el('div', 'pc-card');
+  wrap.append(el('h4', 'pc-name', t.name || 'Unnamed'));
+  const side = { party: 'Party', ally: 'Ally', hostile: 'Hostile' }[sideOf(t)];
+  wrap.append(el('div', 'pc-sub', [side, combatantCr(t) && `CR ${combatantCr(t)}`, t.hidden && 'hidden'].filter(Boolean).join(' · ')));
+  const max = effectiveMax(t.maxHp, s);
+  const stats = el('div', 'pc-stats');
+  const stat = (k, v) => { const d = el('div', 'pc-stat'); d.append(el('span', 'pc-k', k), v instanceof Node ? v : el('span', 'pc-v', v ?? '–')); stats.append(d); };
+  stat('AC', t.ac ?? '–'); stat('Init', t.init ?? '–');
+  stat('HP', el('span', `pc-v ${hpStateOf(t.hp, max)}${s.tempHp ? ' has-temp' : ''}`, `${t.hp ?? '–'}${max != null ? `/${max}` : ''}${s.tempHp ? ` +${s.tempHp}` : ''}`));
+  stat('Side', side);
+  wrap.append(stats);
+  const speed = creature?.statblock?.speed;
+  if (speed) {
+    const adj = adjustedSpeed(speed, s);
+    const p = el('p', 'pc-line');
+    p.append(el('strong', '', 'Speed '));
+    if (adj.changed) p.append(el('s', 'sb-struck', speed), document.createTextNode(' '), el('strong', 'sb-adjusted', adj.text), el('span', 'sb-reason', ` (${adj.reason})`));
+    else p.append(document.createTextNode(speed));
+    wrap.append(p);
+  }
+  appendStatusLines(wrap, s);
+  return wrap;
+}
+
 const PartyPanel = L.Control.extend({
   options: { position: 'bottomleft' },
   onAdd() {
@@ -1234,71 +1475,140 @@ const PartyPanel = L.Control.extend({
     L.DomEvent.disableScrollPropagation(root);
     root.addEventListener('click', e => e.stopPropagation());
 
+    const iconBtn = (text, label, fn) => {
+      const b = el('button', 'icon-btn', text);
+      b.type = 'button';
+      b.setAttribute('aria-label', label);
+      b.title = label;
+      b.addEventListener('click', fn);
+      return b;
+    };
+
+    // Set a tracked character's HP (absolute, or "+5" / "-7"; damage comes off temp HP first), here and in any fight
+    const setHp = (c, raw) => {
+      if (raw === '') return;
+      dm.update(d => {
+        const t = d.bestiary.find(x => x.id === c.id);
+        if (!t) return;
+        const max = effectiveMax(t.hp, t);
+        const cur = t.currentHp ?? t.hp ?? 0;
+        let v;
+        if (/^[+-]\d+$/.test(raw)) {
+          let delta = Number(raw);
+          if (delta < 0 && t.tempHp) { const a = Math.min(t.tempHp, -delta); t.tempHp = t.tempHp - a || null; delta += a; }
+          v = cur + delta;
+        } else v = Number(raw);
+        if (!Number.isFinite(v)) return;
+        v = Math.max(0, Math.round(v));
+        if (max != null) v = Math.min(v, max);
+        t.currentHp = v;
+        d.tracker.combatants.filter(x => x.source?.type === 'library' && x.source.slug === c.id).forEach(x => { x.hp = v; x.tempHp = t.tempHp ?? null; });
+      });
+    };
+
     const render = () => {
       const open = panelOpen('party');
-      const members = dm.data.bestiary.filter(c => c.inParty)
-        .sort((a, b) => creatureName(a).localeCompare(creatureName(b)));
+      const byName = (a, b) => creatureName(a).localeCompare(creatureName(b));
+      const groups = [['party', null], ['sidekick', 'Sidekicks'], ['oncall', 'On call']]
+        .map(([role, title]) => [title, dm.data.bestiary.filter(c => roleOf(c) === role).sort(byName)]);
+      const members = groups[0][1];
+      const anyone = groups.some(([, list]) => list.length);
       root.replaceChildren();
 
       const head = el('header', 'dm-head');
       head.append(el('h2', 'dm-title', `Party${members.length ? ` (${members.length})` : ''}`));
       const tools = el('div', 'dm-tools');
-      const bestiaryBtn = el('button', 'icon-btn', '📖');
-      bestiaryBtn.type = 'button';
-      bestiaryBtn.setAttribute('aria-label', 'Open the bestiary to change who is in the party');
-      bestiaryBtn.title = 'Change who is in the party (Bestiary)';
-      bestiaryBtn.addEventListener('click', () => openBestiary());
-      const toggle = el('button', 'icon-btn', open ? '–' : '+');
-      toggle.type = 'button';
-      toggle.setAttribute('aria-label', open ? 'Minimize the party' : 'Show the party');
+      if (anyone) {
+        tools.append(iconBtn('☾', 'Long rest: full HP, temp HP cleared, one level of exhaustion removed, long-rest effects ended', () => {
+          if (!confirm('Long rest for everyone with a role?\n\n• HP back to full\n• Temp HP cleared\n• One level of exhaustion removed\n• "Long rest" effects ended')) return;
+          dm.update(d => {
+            d.bestiary.filter(isTracked).forEach(c => {
+              c.exhaustion = Math.max(0, (c.exhaustion || 0) - 1);
+              c.tempHp = null;
+              c.effects = (c.effects || []).filter(e => e.until !== 'rest');
+              c.currentHp = effectiveMax(c.hp, c) ?? c.currentHp;
+              d.tracker.combatants.filter(x => x.source?.type === 'library' && x.source.slug === c.id)
+                .forEach(x => { x.hp = c.currentHp; x.tempHp = null; x.exhaustion = c.exhaustion; });
+            });
+          });
+        }));
+      }
+      tools.append(iconBtn('📖', 'Change roles (Bestiary)', () => openBestiary()), iconBtn('✨', 'Spellbook', () => openSpellbook()));
+      const toggle = iconBtn(open ? '–' : '+', open ? 'Minimize the party' : 'Show the party', () => { setPanelOpen('party', !open); render(); });
       toggle.setAttribute('aria-expanded', String(open));
-      toggle.addEventListener('click', () => { setPanelOpen('party', !open); render(); });
-      const spellBtn = el('button', 'icon-btn', '✨');
-      spellBtn.type = 'button';
-      spellBtn.setAttribute('aria-label', 'Open your spellbook');
-      spellBtn.title = 'Spellbook';
-      spellBtn.addEventListener('click', () => openSpellbook());
-      tools.append(bestiaryBtn, spellBtn, toggle);
+      tools.append(toggle);
       head.append(tools);
       root.append(head);
       if (!open) return;
 
-      if (!members.length) {
-        root.append(el('p', 'dm-empty', 'No one is tagged Party yet. Tick "Party member" on characters in the Bestiary (📖).'));
+      if (!anyone) {
+        root.append(el('p', 'dm-empty', 'No one has a role yet. Set "Role in the party" on characters in the Bestiary (📖).'));
         return;
       }
       const table = el('table', 'party-table');
       const thead = el('thead');
       const hr = el('tr');
-      [['', 'Name'], ['AC', 'Armor Class'], ['PP', 'Passive Perception'], ['Init', 'Initiative bonus (Dex modifier)']].forEach(([t, full]) => {
+      [['', 'Name'], ['AC', 'Armor Class'], ['PP', 'Passive Perception'], ['Init', 'Initiative bonus'], ['HP', 'Current HP (carries between fights)']].forEach(([t, full]) => {
         const th = el('th', '', t);
         th.scope = 'col';
-        if (full && t) th.title = full;
-        if (!t) th.append(el('span', 'sr-only', full));
+        if (t) th.title = full; else th.append(el('span', 'sr-only', full));
         hr.append(th);
       });
       thead.append(hr);
       const tbody = el('tbody');
       const dash = v => (v === null || v === undefined || v === '' ? '–' : String(v));
-      members.forEach(c => {
+      const row = c => {
         const tr = el('tr');
         const nameCell = el('th');
         nameCell.scope = 'row';
+        const nameWrap = el('span', 'party-name-wrap');
         const nameBtn = el('button', 'party-name', creatureName(c));
         nameBtn.type = 'button';
-        nameBtn.title = `Open ${creatureName(c)} in the Bestiary`;
         nameBtn.addEventListener('click', () => openBestiary(c.id));
-        nameCell.append(nameBtn);
+        attachHoverCard(nameBtn, () => partyCard(findCreature(c.id) || c));
+        nameWrap.append(nameBtn);
+        const icon = statusIcon(c);
+        if (icon.count) {
+          const ic = el('span', `party-status ${icon.cls}`, icon.glyph);
+          ic.setAttribute('aria-label', `Status: ${icon.summary}`);
+          ic.tabIndex = 0;
+          attachHoverCard(ic, () => partyCard(findCreature(c.id) || c));
+          nameWrap.append(ic);
+        }
+        nameCell.append(nameWrap);
         const init = c.initBonus ?? (c.statblock?.abilities ? abilityMod(c.statblock.abilities.dex) : null);
-        tr.append(nameCell,
-          el('td', '', dash(c.ac)),
-          el('td', '', dash(c.passive)),
-          el('td', '', init === null || init === undefined ? '–' : signed(init)));
-        tbody.append(tr);
+        const max = effectiveMax(c.hp, c);
+        const cur = c.currentHp ?? c.hp;
+        const hpCell = el('td', 'party-hp');
+        const hpIn = el('input', `init-input party-hp-input ${hpStateOf(cur, max)}${c.tempHp ? ' has-temp' : ''}`);
+        hpIn.type = 'text';
+        hpIn.inputMode = 'numeric';
+        hpIn.value = cur ?? '';
+        hpIn.placeholder = '–';
+        hpIn.setAttribute('aria-label', `Current HP for ${creatureName(c)} (type -7 or +5 to adjust)`);
+        hpIn.addEventListener('change', () => setHp(c, hpIn.value.trim()));
+        hpIn.addEventListener('keydown', e => { if (e.key === 'Enter') hpIn.blur(); });
+        hpIn.addEventListener('focus', () => hpIn.select());
+        hpCell.append(hpIn, el('span', `party-hp-max${max !== c.hp ? ' is-halved' : ''}`, max != null ? `/${max}` : ''));
+        if (c.tempHp) hpCell.append(el('span', 'party-hp-temp', `+${c.tempHp}`));
+        tr.append(nameCell, el('td', '', dash(c.ac)), el('td', '', dash(c.passive)), el('td', '', init == null ? '–' : signed(init)), hpCell);
+        return tr;
+      };
+      groups.forEach(([title, list]) => {
+        if (!list.length) return;
+        if (title) {
+          const sub = el('tr', 'party-sub');
+          const cell = el('th', '', title);
+          cell.colSpan = 5;
+          sub.append(cell);
+          tbody.append(sub);
+        }
+        list.forEach(c => tbody.append(row(c)));
       });
       table.append(thead, tbody);
       root.append(table);
     };
+    refreshPartyPanel = render;
     dm.subscribe(render);
     render();
     return root;
@@ -1434,7 +1744,12 @@ const signed = n => (n >= 0 ? `+${n}` : `${n}`);
 const rollD20 = () => 1 + Math.floor(Math.random() * 20);
 const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Open5e text uses light markdown (_italic_, **bold**); show it as plain text
-const plainDesc = s => String(s || '').replace(/\*\*(.+?)\*\*/g, '$1').replace(/(^|\W)_(.+?)_(?=\W|$)/g, '$1$2');
+// Open5e text uses light markdown (_italic_, **bold**) and, in newer entries, HTML line breaks (<br>).
+// Show it as plain text with real line breaks.
+const plainDesc = s => String(s || '')
+  .replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|li)>\s*/gi, '\n').replace(/<[^>]+>/g, '')
+  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+  .replace(/\*\*(.+?)\*\*/g, '$1').replace(/(^|\W)_(.+?)_(?=\W|$)/g, '$1$2');
 
 // Names for new combatants: "Goblin", or "Goblin 1", "Goblin 2"… once there's more than one
 function nextNames(combatants, base, count) {
@@ -1539,18 +1854,89 @@ const findCreature = id => dm.data.bestiary.find(c => c.id === id);
 const findPreset = id => dm.data.presets.find(p => p.id === id);
 const isPcPage = page => /\b(pcs?|player characters?)\b/i.test(page?.tag || '');
 // Characters get the Character section: linked to a PC page, or tagged Party
-const isCharacter = c => !!c && (c.inParty || isPcPage(findCreaturePage(c.notionId)));
+const isCharacter = c => !!c && (isTracked(c) || isPcPage(findCreaturePage(c.notionId)));
 
 // Add every Party member who isn't already in initiative (players roll their own initiative)
+// Roles: "party" (PC), "sidekick" (DM-run character, fights as an Ally), "oncall" (familiar, mount,
+// summon: joins initiative hidden until called in). All three carry HP and status between fights.
+const ROLES = { party: 'Party member', sidekick: 'Sidekick', oncall: 'On call' };
+const roleOf = c => (c?.role in ROLES ? c.role : c?.inParty ? 'party' : '');
+const isTracked = c => !!roleOf(c);
+const trackedCreatureFor = (d, t) => (t?.source?.type === 'library' ? d.bestiary.find(x => x.id === t.source.slug && isTracked(x)) : null);
+const startHp = c => (isTracked(c) && c.currentHp != null ? (c.hp != null ? Math.min(c.currentHp, c.hp) : c.currentHp) : c.hp);
+// Call inside dm.update after changing a combatant's HP
+function keepTrackedHp(d, t) { const c = trackedCreatureFor(d, t); if (c && t.hp != null) c.currentHp = t.hp; }
+// Where a combatant's status lives: on its Bestiary creature if tracked, otherwise on the row itself
+const statusHolder = (d, t) => trackedCreatureFor(d, t) || t;
+const statusFor = t => (t?.source?.type === 'library' && isTracked(findCreature(t.source.slug)) ? findCreature(t.source.slug) : t) || {};
+
+/* ---- Conditions and exhaustion (2014 rules), shown as reminders; nothing is applied automatically ---- */
+const CONDITIONS = {
+  Blinded: "Can't see; fails checks that need sight. Attacks against it have advantage; its attacks have disadvantage.",
+  Charmed: "Can't attack the charmer or target them with harmful effects. Charmer has advantage on social checks.",
+  Deafened: "Can't hear; fails checks that need hearing.",
+  Frightened: "Disadvantage on checks and attacks while the source is in sight. Can't move closer to it.",
+  Grappled: 'Speed 0. Ends if the grappler is incapacitated or it is moved out of reach.',
+  Incapacitated: "Can't take actions or reactions.",
+  Invisible: "Can't be seen without magic or special senses. Attacks against it have disadvantage; its attacks have advantage.",
+  Paralyzed: "Incapacitated; can't move or speak. Fails Str and Dex saves. Attacks have advantage; hits within 5 ft. are crits.",
+  Petrified: "Turned to stone. Incapacitated, can't move or speak. Fails Str and Dex saves. Attacks have advantage. Resists all damage.",
+  Poisoned: 'Disadvantage on attack rolls and ability checks.',
+  Prone: 'Crawls unless it stands (half its movement). Disadvantage on its attacks. Attacks within 5 ft. have advantage, farther away disadvantage.',
+  Restrained: 'Speed 0. Attacks against it have advantage; its attacks have disadvantage. Disadvantage on Dex saves.',
+  Stunned: "Incapacitated, can't move, speaks falteringly. Fails Str and Dex saves. Attacks against it have advantage.",
+  Unconscious: "Incapacitated, can't move or speak, drops what it holds, falls prone. Fails Str and Dex saves. Attacks have advantage; hits within 5 ft. are crits.",
+};
+const INCLUDES_INCAPACITATED = ['Paralyzed', 'Petrified', 'Stunned', 'Unconscious'];
+const NO_MOVE = ['Grappled', 'Restrained', 'Paralyzed', 'Petrified', 'Stunned', 'Unconscious'];
+const EXHAUSTION = ['', 'Disadvantage on ability checks', 'Speed halved', 'Disadvantage on attack rolls and saving throws',
+  'Hit point maximum halved', 'Speed reduced to 0', 'Death'];
+const exhaustionSummary = n => EXHAUSTION.slice(1, n + 1).join(' · ');
+const UNTIL = { fight: 'End of fight', rest: 'Long rest', removed: 'Until removed' };
+// Effective max HP (exhaustion 4+ halves it)
+const effectiveMax = (max, status) => (max != null && (status?.exhaustion || 0) >= 4 ? Math.floor(max / 2) : max);
+// The status icon, without numbers: ◇ nothing; ◆ one thing; ◆ on a filled background when there's more
+// than one. Amber when exhaustion is involved, purple otherwise. Temp HP isn't counted: the HP box turns purple.
+function statusIcon(s) {
+  const items = [s?.exhaustion ? `Exhaustion ${s.exhaustion} (${exhaustionSummary(s.exhaustion)})` : '',
+    ...(s?.conditions || []), ...(s?.effects || []).map(e => `${e.text} (${UNTIL[e.until] || ''})`)].filter(Boolean);
+  return {
+    glyph: items.length ? '◆' : '◇',
+    cls: [items.length && 'has-status', items.length > 1 && 'is-multi', s?.exhaustion && 'is-exhaustion'].filter(Boolean).join(' '),
+    summary: items.join(' · '),
+    count: items.length,
+  };
+}
+// Short badge for a status: "E2 +5 •3"
+function statusBadge(s) {
+  const n = (s?.conditions?.length || 0) + (s?.effects?.length || 0);
+  return [s?.exhaustion ? `E${s.exhaustion}` : '', s?.tempHp ? `+${s.tempHp}` : '', n ? `•${n}` : ''].filter(Boolean).join(' ');
+}
+// Speeds with exhaustion and can't-move conditions applied: returns { text, changed, reason }
+function adjustedSpeed(speed, status) {
+  if (!speed) return { text: speed, changed: false };
+  const ex = status?.exhaustion || 0;
+  const stuck = (status?.conditions || []).find(c => NO_MOVE.includes(c));
+  if (ex >= 5 || stuck) return { text: '0 ft.', changed: true, reason: ex >= 5 ? 'Exhaustion 5' : stuck };
+  if (ex >= 2) {
+    return { text: speedText(parseSpeed(speed).map(s => (s.raw ? s : { ...s, ft: Math.floor(s.ft / 2) }))), changed: true, reason: `Exhaustion ${ex}` };
+  }
+  return { text: speed, changed: false };
+}
+
+let refreshPartyPanel = null;   // set by the Party panel, so quiet HP edits in the tracker show there too
+
 function addParty() {
-  const members = dm.data.bestiary.filter(c => c.inParty);
+  const members = dm.data.bestiary.filter(isTracked);
   const present = new Set(dm.data.tracker.combatants.filter(c => c.source?.type === 'library').map(c => c.source.slug));
   const missing = members.filter(c => !present.has(c.id));
   if (!missing.length) return { added: 0, total: members.length };
   dm.update(d => {
     missing.forEach(c => d.tracker.combatants.push({
-      id: newId(), name: creatureName(c), init: null, hp: c.hp, maxHp: c.hp, ac: c.ac, notes: '',
-      source: { type: 'library', slug: c.id }, side: 'party', hidden: false, level: c.level ?? null, cr: c.cr || '',
+      id: newId(), name: creatureName(c), init: null, hp: startHp(c), maxHp: c.hp, ac: c.ac, notes: '',
+      source: { type: 'library', slug: c.id }, side: roleOf(c) === 'party' ? 'party' : 'ally',
+      hidden: roleOf(c) === 'oncall',   // familiars, mounts and summons wait until you bring them in
+      level: c.level ?? null, cr: c.cr || '',
     }));
   });
   return { added: missing.length, total: members.length };
@@ -1579,6 +1965,7 @@ const nameSourceLabel = c => ((c.nameOverride || '').trim() ? 'Your name'
 function migrateCreatures(bestiary) {
   (bestiary || []).forEach(c => {
     if (c.nameOverride === undefined) c.nameOverride = c.statblock && c.name === c.statblock.name ? '' : (c.name || '');
+    if (c.role === undefined) c.role = c.inParty ? 'party' : c.companion ? 'sidekick' : '';
   });
 }
 const findCreaturePage = id => dm.creaturePages.find(p => p.id === id);
@@ -1591,10 +1978,10 @@ function addFromBestiary(creature, count = 1) {
     names.forEach(n => d.tracker.combatants.push({
       id: newId(), name: n,
       init: rollD20() + (creature.initBonus ?? abilityMod(creature.statblock?.abilities?.dex)),
-      hp: creature.hp, maxHp: creature.hp, ac: creature.ac,
+      hp: startHp(creature), maxHp: creature.hp, ac: creature.ac,
       notes: '', source: { type: 'library', slug: creature.id },
       // PCs (linked to a Notion page tagged PC) join the party; everything else starts hostile
-      side: creature.inParty ? 'party' : 'hostile',
+      side: roleOf(creature) === 'party' ? 'party' : roleOf(creature) ? 'ally' : 'hostile',
       hidden: false, level: null, cr: creature.cr || '',
     }));
   });
@@ -1618,7 +2005,7 @@ function notionLinks(page) {
 
 // Read a stat block's Spellcasting / Innate Spellcasting trait:
 // ability, save DC, attack bonus, the intro sentence, and each spell with its level or note.
-const ABILITY_KEYS = { intelligence: 'int', wisdom: 'wis', charisma: 'cha' };
+const ABILITY_KEYS = { intelligence: 'int', wisdom: 'wis', charisma: 'cha', int: 'int', wis: 'wis', cha: 'cha' };
 function spellcastingTrait(sb) {
   return (sb?.traits || []).find(t => /spellcasting/i.test(t.name || '') && /:/.test(t.desc || ''));
 }
@@ -1626,7 +2013,9 @@ function parseSpellcasting(sb) {
   const trait = spellcastingTrait(sb);
   if (!trait) return null;
   const desc = plainDesc(trait.desc);
-  const ability = (desc.match(/spellcasting ability is (\w+)/i) || [])[1];
+  // "spellcasting ability is Charisma", "using CHA as the spellcasting ability", "Wisdom is its spellcasting ability"
+  const ability = (desc.match(/spellcasting ability is (\w+)/i) || desc.match(/using (\w+) as (?:the|its) spellcasting ability/i)
+    || desc.match(/(\w+) is (?:the|its) spellcasting ability/i) || [])[1];
   const dc = (desc.match(/spell save DC (\d+)/i) || [])[1];
   const attack = (desc.match(/([+-]\d+) to hit with spell attacks/i) || [])[1];
   const spells = [], levelNotes = {};
@@ -1684,7 +2073,7 @@ async function spellsFromStatblock(sb) {
     const key = hit ? hit.key : unlinkedKey(p.name);
     if (seen.has(key)) return;
     seen.add(key);
-    spells.push({ key, name: hit?.name || spellTitle(p.name), level: hit?.level ?? p.level ?? 0, prepared: true, note: p.note || '' });
+    spells.push({ key, name: hit?.name || spellTitle(p.name), level: hit?.level ?? p.level ?? null, prepared: true, note: p.note || '' });
   });
   return { spells, ability: parsed.ability, dc: parsed.dc, attack: parsed.attack };
 }
@@ -1785,7 +2174,7 @@ function buildMergeItems(target, src) {
   (src.spells || []).forEach(sp => {
     const has = (target.spells || []).some(x => resolved(x.key) === resolved(sp.key)) || textSpells.has(nameKey(spellInfo(sp.key)?.name || sp.name));
     items.push({ group: 'Spellcasting', label: spellInfo(sp.key)?.name || sp.name,
-      detail: has ? 'already has this' : [sp.level === 0 ? 'Cantrip' : `Level ${sp.level}`, sp.note, sp.key.startsWith('u:') && 'not linked'].filter(Boolean).join(' · '),
+      detail: has ? 'already has this' : [sp.level == null ? '' : sp.level === 0 ? 'Cantrip' : `Level ${sp.level}`, sp.note, sp.key.startsWith('u:') && 'not linked'].filter(Boolean).join(' · '),
       disabled: has, apply: c => { c.spells = c.spells || []; if (!c.spells.some(x => resolved(x.key) === resolved(sp.key))) c.spells.push(structuredClone(sp)); } });
   });
   return items;
@@ -1821,18 +2210,30 @@ function renderSpellcasting(creature) {
     creature.spellDc != null && `spell save DC ${creature.spellDc}`,
     creature.spellAttack != null && `${signed(creature.spellAttack)} to hit with spell attacks`].filter(Boolean);
   if (bits.length) sec.append(el('p', 'sb-line', bits.join(' · ')));
-  const byLevel = new Map();
+  // Innate spells (noted "at will" or "N/day") are grouped by use, the way stat blocks print them;
+  // everything else by spell level
+  const USE = /^(at will|(\d+)\s*\/\s*day)/i;
+  const groups = new Map();
   (creature.spells || []).forEach(sp => {
     const info = spellInfo(sp.key);
-    const level = info?.level ?? sp.level ?? 0;
-    if (!byLevel.has(level)) byLevel.set(level, []);
-    byLevel.get(level).push({ ...sp, name: info?.name || sp.name, level });
+    const level = info?.level ?? sp.level ?? null;
+    const use = (sp.note || '').match(USE);
+    const key = use ? `use:${use[2] ? use[2] : 'at will'}` : `lvl:${level ?? 0}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ ...sp, name: info?.name || sp.name, level, note: use ? sp.note.replace(USE, '').replace(/^[\s,]+/, '') : sp.note });
   });
-  [...byLevel.keys()].sort((a, b) => a - b).forEach(level => {
+  const order = k => (k.startsWith('lvl:') ? Number(k.slice(4)) : k === 'use:at will' ? 100 : 200 - Number(k.slice(4)));
+  [...groups.keys()].sort((a, b) => order(a) - order(b)).forEach(key => {
     const p = el('p', 'sb-spell-level');
-    const slots = parsed?.levelNotes?.[level];
-    p.append(el('strong', '', `${level === 0 ? 'Cantrips' : `${ordinal(level)} level`}${slots ? ` (${slots})` : ''}: `));
-    byLevel.get(level).sort((a, b) => a.name.localeCompare(b.name)).forEach((sp, i) => {
+    let label;
+    if (key.startsWith('use:')) label = key === 'use:at will' ? 'At will' : `${key.slice(4)}/day each`;
+    else {
+      const level = Number(key.slice(4));
+      const slots = parsed?.levelNotes?.[level];
+      label = `${level === 0 ? 'Cantrips' : `${ordinal(level)} level`}${slots ? ` (${slots})` : ''}`;
+    }
+    p.append(el('strong', '', `${label}: `));
+    groups.get(key).sort((a, b) => a.name.localeCompare(b.name)).forEach((sp, i) => {
       if (i) p.append(document.createTextNode(', '));
       if (sp.key.startsWith('u:')) {
         // Not linked to a Spellbook spell yet: show the name, link it in the Bestiary editor
@@ -1853,9 +2254,41 @@ function renderSpellcasting(creature) {
   return sec;
 }
 
+// Show what a status changes, without applying any rules: cross out speed (exhaustion 2/5, can't-move
+// conditions) and max HP (exhaustion 4), and add a banner listing exhaustion, conditions, effects and temp HP.
+function decorateWithStatus(block, creature, status) {
+  const ex = status.exhaustion || 0;
+  const struck = (lineEl, label, oldText, newText, reason) => {
+    lineEl.replaceChildren(el('strong', '', `${label} `), el('s', 'sb-struck', oldText), document.createTextNode(' '),
+      el('strong', 'sb-adjusted', newText), el('span', 'sb-reason', ` (${reason})`));
+  };
+  const lines = [...block.querySelectorAll('.sb-line')];
+  const speedLine = lines.find(l => l.textContent.startsWith('Speed '));
+  const speed = creature.statblock?.speed;
+  const adj = adjustedSpeed(speed, status);
+  if (speedLine && adj.changed) struck(speedLine, 'Speed', speed, adj.text, adj.reason);
+  const hpLine = lines.find(l => l.textContent.startsWith('Hit Points '));
+  const max = creature.hp ?? creature.statblock?.hp;
+  if (hpLine && ex >= 4 && max != null) {
+    const dice = creature.hitDice || creature.statblock?.hitDice;
+    struck(hpLine, 'Hit Points', `${max}${dice ? ` (${dice})` : ''}`, `${effectiveMax(max, status)} max`, `Exhaustion ${ex}`);
+  }
+  const bits = [];
+  if (ex) bits.push([`Exhaustion ${ex}`, exhaustionSummary(ex)]);
+  (status.conditions || []).forEach(c => bits.push([c, CONDITIONS[c] || 'Custom condition']));
+  (status.effects || []).forEach(e => bits.push([e.text, UNTIL[e.until] || '']));
+  if (status.tempHp) bits.push([`${status.tempHp} temporary HP`, 'Damage comes off this first']);
+  if (bits.length) {
+    const banner = el('div', 'sb-status');
+    bits.forEach(([what, why]) => { const p = el('p'); p.append(el('strong', '', `${what}. `), document.createTextNode(why)); banner.append(p); });
+    block.insertBefore(banner, block.children[2] || null);
+  }
+}
+
 // What a creature from your bestiary shows in the tracker and the bestiary menu:
 // its stat block (your copy, with the tracker numbers on top) plus your notes and Notion links
-function renderCreatureBlock(creature) {
+// status: whose temp HP / exhaustion / conditions / effects to show (tracked creatures carry their own)
+function renderCreatureBlock(creature, status = isTracked(creature) ? creature : null) {
   const sb = creature.statblock || {};
   const linkedSpells = creature.spells?.length > 0;
   const block = renderStatBlock({
@@ -1868,7 +2301,7 @@ function renderCreatureBlock(creature) {
     cr: creature.cr || sb.cr,
     xp: xpForCr(creature.cr) ?? sb.xp,
     initBonus: creature.initBonus,
-    homebrew: !creature.source,
+    homebrew: !creature.source && !isCharacter(creature),   // PCs and companions aren't "homebrew"
   });
   const casts = creature.spells?.length || creature.spellAbility;
   if (isCharacter(creature)) {
@@ -1893,6 +2326,7 @@ function renderCreatureBlock(creature) {
     notes.append(el('h4', 'sb-heading', 'Your notes'), el('p', 'sb-desc', creature.notes));
     block.append(notes);
   }
+  if (status) decorateWithStatus(block, creature, status);
   const links = notionLinks(findCreaturePage(creature.notionId));
   if (links.length) {
     const row = el('div', 'sb-links');
@@ -1961,7 +2395,8 @@ const InitiativeTracker = L.Control.extend({
     L.DomEvent.disableScrollPropagation(root);
     root.addEventListener('click', e => e.stopPropagation());
     const openNotes = new Set();
-    let hpTargetId = null;   // who the Damage / Heal bar points at
+    let hpTargetId = null;
+    let refreshNote = '';    // "Refreshed 5 · 2 not found", shown on the Refresh button for a moment   // who the Damage / Heal bar points at
 
     // Health band from current vs max HP: healthy > 1/2, bloodied <= 1/2, critical <= 1/4, down at 0
     const hpState = c => {
@@ -1985,6 +2420,21 @@ const InitiativeTracker = L.Control.extend({
       c.hp = next;
     };
 
+    // Damage comes off temp HP first; healing can't pass the (exhaustion-halved) max; tracked HP is written back
+    const hpChange = (d, t, delta) => {
+      const st = statusHolder(d, t);
+      if (delta < 0 && st.tempHp) {
+        const absorbed = Math.min(st.tempHp, -delta);
+        st.tempHp = st.tempHp - absorbed || null;
+        if (st !== t) t.tempHp = st.tempHp;
+        delta += absorbed;
+      }
+      applyHp(t, delta);
+      const cap = effectiveMax(t.maxHp, st);
+      if (delta > 0 && cap != null && t.hp > cap) t.hp = cap;
+      keepTrackedHp(d, t);
+    };
+
     const numOrNull = v => (v === '' || v == null || !Number.isFinite(Number(v)) ? null : Math.round(Number(v)));
     const btn = (text, label, onClick, cls = 'icon-btn') => {
       const b = el('button', cls, text);
@@ -1996,7 +2446,7 @@ const InitiativeTracker = L.Control.extend({
 
     // "+ Add party": everyone tagged Party in the Bestiary who isn't in initiative yet
     const partyButton = () => {
-      const count = dm.data.bestiary.filter(c => c.inParty).length;
+      const count = dm.data.bestiary.filter(isTracked).length;
       const b = btn('+ Add party', count ? `Add the ${count} Party member${count === 1 ? '' : 's'} not already in initiative`
         : 'Tag creatures as Party members in the Bestiary to add them all at once', () => {
         const { added, total } = addParty();
@@ -2158,7 +2608,9 @@ const InitiativeTracker = L.Control.extend({
 
     // Fill a Damage / Heal pill from a combatant (name, HP, health color)
     const fillPill = (pill, c) => {
-      pill.className = `hp-pill ${hpState(c)}`;
+      const temp = statusFor(c).tempHp;
+      pill.className = `hp-pill ${hpState(c)}${temp ? ' has-temp' : ''}`;
+      pill.title = temp ? `${c.hp ?? 0} HP + ${temp} temporary` : '';
       pill.replaceChildren(el('span', 'hp-pill-name', c.name || 'Unnamed'));
       if (c.hp !== null && c.hp !== undefined) {
         pill.append(el('span', 'hp-pill-hp', c.maxHp ? `${c.hp}/${c.maxHp}` : `${c.hp}`));
@@ -2226,7 +2678,7 @@ const InitiativeTracker = L.Control.extend({
       // Rows
       const table = el('div', 'init-table');
       const cols = el('div', 'init-row init-cols');
-      ['', '', 'Init', 'Name', 'HP', 'Max', 'AC', '', '', '', ''].forEach(t => cols.append(el('span', '', t)));
+      ['', '', '', 'Init', 'Name', 'HP', 'Max', 'AC', '', '', '', ''].forEach(t => cols.append(el('span', '', t)));
       table.append(cols);
       if (!list.length) table.append(el('p', 'dm-empty', 'Add combatants, or load a saved encounter below.'));
 
@@ -2234,6 +2686,14 @@ const InitiativeTracker = L.Control.extend({
         const row = el('div', `init-row${i === tracker.turn ? ' is-turn' : ''}${c.hidden ? ' is-hidden' : ''}`);
         paintHp(row, c);
         row.append(el('span', 'turn-mark', i === tracker.turn ? '▶' : ''));
+        // Status: temp HP, exhaustion, conditions, lingering effects (◇ when there's nothing)
+        const st = statusFor(c);
+        const icon = statusIcon(st);
+        const stBtn = btn(icon.glyph, `Status for ${c.name || 'combatant'}: ${icon.summary || 'nothing set (click for temp HP, exhaustion, conditions, effects)'}`,
+          () => openStatusPopup(c.id), `status-btn ${icon.cls}`);
+        stBtn.removeAttribute('title');   // the hover card replaces the browser tooltip
+        attachHoverCard(stBtn, () => combatantCard(dm.data.tracker.combatants.find(x => x.id === c.id) || c));
+        row.append(stBtn);
         // Side chip: click to cycle Party → Ally → Hostile
         const side = sideOf(c);
         const SIDES = { party: ['P', 'Party'], ally: ['A', 'Ally'], hostile: ['H', 'Hostile'] };
@@ -2258,12 +2718,14 @@ const InitiativeTracker = L.Control.extend({
               if (opts.text) target[key] = raw;
               else if (key === 'hp' && /^[+-]\d+$/.test(raw)) {
                 // "-7" deals 7 damage, "+5" heals 5
-                applyHp(target, Number(raw));
+                hpChange(d, target, Number(raw));
                 input.value = target.hp;
               } else target[key] = numOrNull(raw);
+              if (key === 'hp') keepTrackedHp(d, target);
               paintHp(row, target);
             }, { quiet: true });
             syncPill(c.id);
+            if (key === 'hp') refreshPartyPanel?.();
           });
           input.addEventListener('keydown', e => { if (e.key === 'Enter') input.blur(); });
           return input;
@@ -2272,7 +2734,17 @@ const InitiativeTracker = L.Control.extend({
         row.append(
           field('init', 'Initiative', 0),
           field('name', 'Name', 0, { text: true, placeholder: 'Name', cls: 'init-name' }),
-          field('hp', 'Current HP', 0, { placeholder: '–' }),
+          (() => {
+            // Purple when there's temp HP: a buffer on top of these hit points
+            const hpInput = field('hp', 'Current HP', 0, { placeholder: '–' });
+            const markTemp = temp => {
+              hpInput.classList.toggle('has-temp', !!temp);
+              hpInput.title = temp ? `${hpInput.value || 0} HP + ${temp} temporary (damage comes off temp HP first)` : '';
+            };
+            markTemp(st.tempHp);
+            hpInput.addEventListener('change', () => markTemp(statusFor(dm.data.tracker.combatants.find(x => x.id === c.id) || c).tempHp));
+            return hpInput;
+          })(),
           field('maxHp', 'Max HP', 0, { placeholder: '–' }),
           field('ac', 'AC', 0, { placeholder: '–' }),
           (() => {
@@ -2316,7 +2788,7 @@ const InitiativeTracker = L.Control.extend({
           if (c.source?.type === 'library') {
             const creature = findCreature(c.source.slug);
             const holder = el('div', 'statblock-holder');
-            if (creature) holder.append(renderCreatureBlock(creature));
+            if (creature) holder.append(renderCreatureBlock(creature, statusFor(c)));
             else holder.textContent = 'This creature is no longer in your bestiary.';
             table.append(holder);
           } else if (c.source?.type === 'open5e' && c.source.slug) {
@@ -2375,7 +2847,7 @@ const InitiativeTracker = L.Control.extend({
           if (!n) { amount.focus(); return; }
           dm.update(d => {
             const target = d.tracker.combatants.find(x => x.id === hpTargetId);
-            if (target) applyHp(target, sign * n);
+            if (target) hpChange(d, target, sign * n);
           });
           root.querySelector('.hp-amount')?.focus();
         };
@@ -2415,7 +2887,12 @@ const InitiativeTracker = L.Control.extend({
           if (!e) return;
           if (list.length && !confirm(`Replace the current initiative with "${e.name}"?`)) return;
           dm.update(d => {
-            d.tracker = { round: 1, turn: 0, combatants: e.combatants.map(c => ({ ...structuredClone(c), id: newId() })) };
+            d.tracker = { round: 1, turn: 0, combatants: e.combatants.map(c => {
+              const t = { ...structuredClone(c), id: newId() };
+              const tracked = trackedCreatureFor(d, t);
+              if (tracked) t.hp = startHp(tracked);   // party and companions keep their current HP
+              return t;
+            }) };
           });
         }, 'btn'),
         btn('Delete', 'Delete the selected saved encounter', () => {
@@ -2441,9 +2918,54 @@ const InitiativeTracker = L.Control.extend({
           });
           dm.save();   // saving an encounter is a deliberate save, so upload it
         }, 'btn'),
+        (() => {
+          // Refresh: re-link rows to Bestiary creatures (by link, then by name) and fill in their numbers
+          const refresh = btn(refreshNote || 'Refresh', 'Re-link rows to your Bestiary and fill in AC, HP, CR, side and stat blocks (fixes older encounters)', () => {
+            if (!list.length) return;
+            let updated = 0, missing = 0;
+            dm.update(d => {
+              const byName = new Map();
+              d.bestiary.forEach(c => {
+                [creatureName(c), c.name, c.statblock?.name, ...splitNames(c.aliases)].filter(Boolean)
+                  .forEach(n => { if (!byName.has(nameKey(n))) byName.set(nameKey(n), c); });
+              });
+              d.tracker.combatants.forEach(t => {
+                const linked = t.source?.type === 'library' ? d.bestiary.find(c => c.id === t.source.slug) : null;
+                const base = String(t.name || '').replace(/\s+\d+$/, '');   // "Goblin 3" -> "Goblin"
+                const creature = linked || byName.get(nameKey(t.name)) || byName.get(nameKey(base));
+                if (!creature) { missing++; return; }
+                const wasFull = t.hp == null || (t.maxHp != null && t.hp >= t.maxHp);
+                t.source = { type: 'library', slug: creature.id };
+                if (creature.ac != null) t.ac = creature.ac;
+                if (creature.hp != null) t.maxHp = creature.hp;
+                t.cr = creature.cr || t.cr || '';
+                t.level = creature.level ?? t.level ?? null;
+                const role = roleOf(creature);
+                if (role) {
+                  t.side = role === 'party' ? 'party' : 'ally';
+                  t.hp = startHp(creature);
+                } else if (t.maxHp != null) {
+                  t.hp = wasFull ? t.maxHp : Math.min(t.hp, t.maxHp);   // keep damage, cap at the new max
+                }
+                updated++;
+              });
+            });
+            refreshNote = `Refreshed ${updated}${missing ? ` · ${missing} not found` : ''}`;
+            render();
+            setTimeout(() => { refreshNote = ''; render(); }, 2500);
+          }, 'btn refresh-btn');
+          return refresh;
+        })(),
         btn('Clear', 'Remove everyone from initiative', () => {
-          if (!list.length || !confirm('Clear the initiative tracker?')) return;
-          dm.update(d => { d.tracker = { round: 1, turn: 0, combatants: [] }; });
+          if (!list.length || !confirm('Clear the initiative tracker?\n\nParty members, sidekicks and on-call creatures keep their HP, temp HP, exhaustion and lasting effects; their conditions and end-of-fight effects are cleared.')) return;
+          dm.update(d => {
+            const inFight = new Set(d.tracker.combatants.filter(c => c.source?.type === 'library').map(c => c.source.slug));
+            d.bestiary.filter(c => isTracked(c) && inFight.has(c.id)).forEach(c => {
+              c.conditions = [];
+              c.effects = (c.effects || []).filter(e => e.until !== 'fight');
+            });
+            d.tracker = { round: 1, turn: 0, combatants: [] };
+          });
         }, 'btn danger'),
       );
       const saveRow = saveControls('dm-save-row init-save');
@@ -2785,14 +3307,22 @@ function openBestiary(selectId = null) {
     }
     nameGroup.append(notion);
 
-    // Party tag: "+ Add party" in the tracker adds everyone tagged
-    const partyLab = el('label', 'bst-check');
-    const partyBox = el('input');
-    partyBox.type = 'checkbox';
-    partyBox.checked = !!creature.inParty;
-    partyBox.addEventListener('change', () => set(c => { c.inParty = partyBox.checked; }, { redraw: true }));
-    partyLab.append(partyBox, document.createTextNode(' Party member (added together with + Add party)'));
-    nameGroup.append(partyLab);
+    // Role in the party: one menu, so a creature can't be two at once
+    const roleLab = el('label', 'bst-field wide');
+    roleLab.append(el('span', 'bst-label', 'Role in the party'));
+    const roleSel = el('select', 'init-input');
+    [['', '— (not with the party)'], ['party', 'Party member: a PC; joins as P, counts toward difficulty'],
+     ['sidekick', 'Sidekick: DM-run character; joins as Ally'], ['oncall', 'On call: familiar, mount or summon; joins hidden until called']]
+      .forEach(([v, t]) => { const o = el('option', '', t); o.value = v; roleSel.append(o); });
+    roleSel.value = roleOf(creature);
+    roleSel.addEventListener('change', () => set(c => {
+      c.role = roleSel.value;
+      c.inParty = roleSel.value === 'party';
+      delete c.companion;
+      if (roleSel.value && c.currentHp == null) c.currentHp = c.hp ?? null;
+    }, { redraw: true }));
+    roleLab.append(roleSel, el('span', 'bst-hint-line', 'Every role carries HP, exhaustion and lingering effects between fights. + Add party brings them all in.'));
+    nameGroup.append(roleLab);
 
     // Character details (PCs and party members)
     if (isCharacter(creature)) {
@@ -2989,7 +3519,7 @@ function openBestiary(selectId = null) {
       if (sp.key.startsWith('u:')) {
         const name = el('span', 'spl-pick-open spl-unlinked-name', sp.name);
         name.title = 'Not linked to a spell in your Spellbook';
-        const lvl = el('span', 'spl-pick-level', (sp.level ?? 0) === 0 ? 'Cantrip' : `L${sp.level}`);
+        const lvl = el('span', 'spl-pick-level', sp.level == null ? '—' : sp.level === 0 ? 'Cantrip' : `L${sp.level}`);
         const actions = el('span', 'spl-link-actions');
         const linkBtn = el('button', 'btn', 'Link…'); linkBtn.type = 'button';
         linkBtn.addEventListener('click', () => relink(row, sp));
@@ -3013,7 +3543,8 @@ function openBestiary(selectId = null) {
       relinkBtn.title = 'Link to a different spell (another source, or your own version)';
       relinkBtn.setAttribute('aria-label', `Link ${sp.name} to a different spell`);
       relinkBtn.addEventListener('click', () => relink(row, sp));
-      const lvl = el('span', 'spl-pick-level', (sp.info?.level ?? sp.level) === 0 ? 'Cantrip' : `L${sp.info?.level ?? sp.level}`);
+      const lvlNum = sp.info?.level ?? sp.level;
+      const lvl = el('span', 'spl-pick-level', lvlNum == null ? '—' : lvlNum === 0 ? 'Cantrip' : `L${lvlNum}`);
       const prep = el('label', 'bst-check spl-prep');
       const box = el('input'); box.type = 'checkbox'; box.checked = !!sp.prepared;
       box.setAttribute('aria-label', `${sp.name} prepared`);
